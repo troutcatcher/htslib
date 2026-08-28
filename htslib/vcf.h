@@ -367,6 +367,27 @@ typedef struct bcf1_t {
     HTSLIB_EXPORT
     int bcf_subset_format(const bcf_hdr_t *hdr, bcf1_t *rec);
 
+    /**
+     *  bcf_hdr_set_parse_formats() - restrict VCF text parsing to given FORMAT fields
+     *  @param fmts  comma-separated list of FORMAT field names to parse
+     *               (e.g. "GT" or "GT,DP"), or NULL to restore parsing of
+     *               all fields
+     *
+     *  Another large fraction of VCF reading time is spent converting the
+     *  values of FORMAT fields the caller never looks at. When set,
+     *  vcf_parse() skips the values of FORMAT fields not named in the list:
+     *  they are neither type-converted nor stored, and they are absent from
+     *  the resulting records, as if the file did not contain them. Fields
+     *  named in the list but absent from a record are simply not present, as
+     *  usual. Only the parsing of VCF text is affected; BCF records are
+     *  always read in full. The setting is kept on the header and is not
+     *  copied by bcf_hdr_dup().
+     *
+     *  Returns 0 on success, -1 on error (out of memory).
+     */
+    HTSLIB_EXPORT
+    int bcf_hdr_set_parse_formats(bcf_hdr_t *hdr, const char *fmts);
+
     /// Write a VCF or BCF header
     /** @param  fp  Output file
         @param  h   The header to write

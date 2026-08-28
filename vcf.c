@@ -116,6 +116,7 @@ typedef struct
     vdict_t dict;   // bcf_hdr_t.dict[0] vdict_t dictionary which keeps bcf_idinfo_t for BCF_HL_FLT,BCF_HL_INFO,BCF_HL_FMT
     hdict_t *gen;   // hdict_t dictionary which keeps bcf_hrec_t* pointers for generic and structured fields
     size_t *key_len;// length of h->id[BCF_DT_ID] strings
+    char *parse_formats; // bcf_hdr_set_parse_formats(): comma-separated FORMAT fields to parse, NULL = all
 }
 bcf_hdr_aux_t;
 
@@ -1455,6 +1456,7 @@ void bcf_hdr_destroy(bcf_hdr_t *h)
                 if ( kh_exist(aux->gen,k) ) free((char*)kh_key(aux->gen,k));
             kh_destroy(hdict, aux->gen);
             free(aux->key_len); // may exist for dict[0] only
+            free(aux->parse_formats);
         }
         kh_destroy(vdict, d);
         free(h->id[i]);
@@ -2779,8 +2781,24 @@ typedef struct {
              max_g:31;  // maximum number of genotypes
     uint32_t max_l;     // length of field
     uint32_t y;         // h->id[0][fmt[j].key].val->info[BCF_HL_FMT]
+    int skip;           // field excluded by bcf_hdr_set_parse_formats()
     uint8_t *buf;       // Pointer into h->mem
 } fmt_aux_t;
+
+// is the NUL-terminated name present in the comma-separated list?
+static int fmt_name_listed(const char *list, const char *name)
+{
+    size_t len = strlen(name);
+    const char *p = list;
+    while (*p)
+    {
+        const char *q = p;
+        while (*q && *q!=',') q++;
+        if ( (size_t)(q-p)==len && memcmp(p,name,len)==0 ) return 1;
+        p = *q==',' ? q+1 : q;
+    }
+    return 0;
+}
 
 // fmt_aux_t field notes:
 // max_* are biggest sizes of the various FORMAT fields across all samples.
@@ -2881,6 +2899,10 @@ static int vcf_parse_format_dict2(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
         fmt[j].key = kh_val(d, k).id;
         fmt[j].is_gt = (t[0] == 'G' && t[1] == 'T' && !t[2]);
         fmt[j].y = h->id[0][fmt[j].key].val->info[BCF_HL_FMT];
+        {
+            const char *keep = get_hdr_aux(h)->parse_formats;
+            fmt[j].skip = keep && !fmt_name_listed(keep, t);
+        }
         v->n_fmt++;
     }
     return 0;
@@ -2888,7 +2910,8 @@ static int vcf_parse_format_dict2(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
 
 // compute max
 static int vcf_parse_format_max3(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
-                                 char *p, char *q, fmt_aux_t *fmt) {
+                                 char *p, char *q, fmt_aux_t *fmt,
+                                 int skip_from) {
     int n_sample_ori = -1;
     char *r = q + 1;  // r: position in the format string
     int l = 0, m = 1, g = 1, j;
@@ -2926,8 +2949,20 @@ static int vcf_parse_format_max3(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
 
         char *r_start = r;
         for (;;) {
-            // Quickly skip ahead to an appropriate meta-character
-            while (!meta[(unsigned char)*r]) r++;
+            if (f->skip) {
+                // excluded by bcf_hdr_set_parse_formats(): the value content
+                // is irrelevant, jump to the next field or end of the column
+                if (j >= skip_from) {
+                    // everything up to the end of the column is skipped
+                    char *rr = memchr(r, '\t', end - r);
+                    r = rr ? rr : r + (end - r); // no tab: the final NUL
+                } else {
+                    r += strcspn(r, ":\t"); // also stops at the final NUL
+                }
+            } else {
+                // Quickly skip ahead to an appropriate meta-character
+                while (!meta[(unsigned char)*r]) r++;
+            }
 
             switch (*r) {
             case ',':
@@ -2982,6 +3017,13 @@ static int vcf_parse_format_alloc4(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
     int j;
     for (j = 0; j < v->n_fmt; ++j) {
         fmt_aux_t *f = &fmt[j];
+        if ( f->skip ) {
+            // excluded by bcf_hdr_set_parse_formats(): vcf_parse_format_fill5
+            // skips the values and vcf_parse_format_gt6 drops the field
+            f->size = -1;
+            f->offset = 0;
+            continue;
+        }
         if ( !f->max_m ) f->max_m = 1;  // omitted trailing format field
 
         if ((f->y>>4&0xf) == BCF_HT_STR) {
@@ -3033,7 +3075,8 @@ static int vcf_parse_format_alloc4(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
 
 // Fill the sample fields
 static int vcf_parse_format_fill5(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
-                                  const char *p, const char *q, fmt_aux_t *fmt) {
+                                  const char *p, const char *q, fmt_aux_t *fmt,
+                                  int skip_from) {
     static int extreme_val_warned = 0;
     int n_sample_ori = -1;
     // At beginning of the loop t points to the first char of a format
@@ -3062,17 +3105,22 @@ static int vcf_parse_format_fill5(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
         {
             fmt_aux_t *z = &fmt[j++];
             const int htype = z->y>>4&0xf;
-            if (!z->buf) {
+            if ( z->size==-1 )
+            {
+                // this field is to be ignored: too big, or excluded from
+                // parsing by bcf_hdr_set_parse_formats(). Sample columns are
+                // NUL-terminated here (vcf_parse_format_max3), so the scans
+                // stop at the column's end.
+                if (j > skip_from) // j was already incremented above
+                    t += strlen(t); // everything else in the column is skipped
+                else
+                    t += strcspn(t, ":");
+            }
+            else if (!z->buf) {
                 hts_log_error("Memory allocation failure for FORMAT field type %d at %s:%"PRIhts_pos,
                               z->y>>4&0xf, bcf_seqname_safe(h,v), v->pos+1);
                 v->errcode |= BCF_ERR_LIMITS;
                 return -1;
-            }
-
-            if ( z->size==-1 )
-            {
-                // this field is to be ignored, it's too big
-                while ( *t != ':' && *t ) t++;
             }
             else if (htype == BCF_HT_STR) {
                 int l;
@@ -3213,6 +3261,7 @@ static int vcf_parse_format_fill5(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
             fmt_aux_t *z = &fmt[j];
             const int htype = z->y>>4&0xf;
             int l;
+            if (z->size==-1) continue; // ignored field, nothing was allocated
             if (htype == BCF_HT_STR) {
                 if (z->is_gt) {
                     int32_t *x = (int32_t*)(z->buf + z->size * (size_t)m);
@@ -3273,16 +3322,15 @@ static int vcf_parse_format_gt6(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
 
     }
     if ( need_downsize ) {
-        i = 1;
-        while ( i < v->n_fmt ) {
-            if ( fmt[i].size==-1 )
-            {
-                memmove(&fmt[i-1],&fmt[i],sizeof(*fmt));
-                v->n_fmt--;
-            }
-            else
-                i++;
+        // drop the ignored fields, which were not written to v->indiv, so
+        // that v->n_fmt matches the number of encoded fields
+        int j = 0;
+        for (i = 0; i < v->n_fmt; i++) {
+            if ( fmt[i].size==-1 ) continue;
+            if ( j!=i ) fmt[j] = fmt[i];
+            j++;
         }
+        v->n_fmt = j;
     }
 
     return 0;
@@ -3346,8 +3394,14 @@ static int vcf_parse_format(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
     // copy the data again to a uniformly sized array.  Two passes through
     // memory, but without doubling string parsing.
 
+    // fields [skip_from, n_fmt) are all excluded from parsing, letting the
+    // scanning passes jump to the end of the sample column in one go once
+    // they reach skip_from (the common case: keep "GT", which comes first)
+    int skip_from = v->n_fmt;
+    while (skip_from > 0 && fmt[skip_from-1].skip) skip_from--;
+
     // compute max
-    if (vcf_parse_format_max3(s, h, v, p, q, fmt) < 0)
+    if (vcf_parse_format_max3(s, h, v, p, q, fmt, skip_from) < 0)
         return -1;
 
     // allocate memory for arrays
@@ -3355,7 +3409,7 @@ static int vcf_parse_format(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
         return -1;
 
     // fill the sample fields; at beginning of the loop
-    if (vcf_parse_format_fill5(s, h, v, p, q, fmt) < 0)
+    if (vcf_parse_format_fill5(s, h, v, p, q, fmt, skip_from) < 0)
         return -1;
 
     // write individual genotype information
@@ -4809,6 +4863,20 @@ bcf_hdr_t *bcf_hdr_subset(const bcf_hdr_t *h0, int n, char *const* samples, int 
     khash_str2int_destroy(names_hash);
     bcf_hdr_destroy(h);
     return NULL;
+}
+
+int bcf_hdr_set_parse_formats(bcf_hdr_t *hdr, const char *fmts)
+{
+    bcf_hdr_aux_t *aux = get_hdr_aux(hdr);
+    char *dup = NULL;
+    if ( fmts )
+    {
+        dup = strdup(fmts);
+        if ( !dup ) return -1;
+    }
+    free(aux->parse_formats);
+    aux->parse_formats = dup;
+    return 0;
 }
 
 int bcf_hdr_set_samples(bcf_hdr_t *hdr, const char *samples, int is_file)

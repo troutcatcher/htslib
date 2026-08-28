@@ -562,6 +562,81 @@ void test_get_format_values(const char *fname)
     check_format_values(fname);
 }
 
+void test_parse_formats(void)
+{
+    static const char vcf_data[] = "data:,"
+        "##fileformat=VCFv4.2\n"
+        "##contig=<ID=1>\n"
+        "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n"
+        "##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"Dosage\">\n"
+        "##FORMAT=<ID=GP,Number=G,Type=Float,Description=\"Probabilities\">\n"
+        "##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Depth\">\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\n"
+        "1\t100\t.\tA\tT\t.\t.\t.\tGT:DS:GP:DP\t0|1:0.9:0.1,0.9,0:13\t1|1:2:0,0,1:7\t./.:0.5\n"
+        "1\t200\t.\tA\tT\t.\t.\t.\tDS:GP\t0.9:0.1,0.9,0\t2:0,0,1\t0:1,0,0\n";
+
+    htsFile *fp = hts_open(vcf_data, "r");
+    if (!fp) error("test_parse_formats: failed to open data: URI");
+    bcf_hdr_t *hdr = bcf_hdr_read(fp);
+    if (!hdr) error("test_parse_formats: failed to read header");
+    check0(bcf_hdr_set_parse_formats(hdr, "GT,DP"));
+    bcf1_t *line = bcf_init();
+    if (!line) error("test_parse_formats: bcf_init : %s", strerror(errno));
+
+    // first record: GT and DP kept, DS and GP skipped
+    if (bcf_read(fp, hdr, line) != 0)
+        error("test_parse_formats: failed to read record 1");
+    if (line->n_fmt != 2)
+        error("test_parse_formats: expected 2 FORMAT fields, got %d", (int)line->n_fmt);
+    int32_t *gt = NULL, *dp = NULL;
+    int ngt = 0, ndp = 0;
+    int n = bcf_get_genotypes(hdr, line, &gt, &ngt);
+    if (n != 6 ||
+        gt[0] != bcf_gt_unphased(0) || gt[1] != bcf_gt_phased(1) ||
+        gt[2] != bcf_gt_unphased(1) || gt[3] != bcf_gt_phased(1) ||
+        !bcf_gt_is_missing(gt[4]) || !bcf_gt_is_missing(gt[5]))
+        error("test_parse_formats: unexpected GT values");
+    n = bcf_get_format_int32(hdr, line, "DP", &dp, &ndp);
+    if (n != 3 || dp[0] != 13 || dp[1] != 7 || dp[2] != bcf_int32_missing)
+        error("test_parse_formats: unexpected DP values");
+    float *fv = NULL;
+    int nf = 0;
+    if (bcf_get_format_float(hdr, line, "DS", &fv, &nf) >= 0)
+        error("test_parse_formats: DS should have been skipped");
+    if (bcf_get_format_float(hdr, line, "GP", &fv, &nf) >= 0)
+        error("test_parse_formats: GP should have been skipped");
+
+    // second record has none of the kept fields
+    if (bcf_read(fp, hdr, line) != 0)
+        error("test_parse_formats: failed to read record 2");
+    if (line->n_fmt != 0)
+        error("test_parse_formats: expected 0 FORMAT fields, got %d", (int)line->n_fmt);
+
+    free(gt);
+    free(dp);
+    free(fv);
+    bcf_destroy(line);
+    bcf_hdr_destroy(hdr);
+    if (hts_close(fp)) error("test_parse_formats: hts_close failed");
+
+    // passing NULL restores parsing of all fields
+    fp = hts_open(vcf_data, "r");
+    if (!fp) error("test_parse_formats: failed to re-open data: URI");
+    hdr = bcf_hdr_read(fp);
+    if (!hdr) error("test_parse_formats: failed to re-read header");
+    check0(bcf_hdr_set_parse_formats(hdr, "GT,DP"));
+    check0(bcf_hdr_set_parse_formats(hdr, NULL));
+    line = bcf_init();
+    if (!line) error("test_parse_formats: bcf_init : %s", strerror(errno));
+    if (bcf_read(fp, hdr, line) != 0)
+        error("test_parse_formats: failed to read record after reset");
+    if (line->n_fmt != 4)
+        error("test_parse_formats: expected 4 FORMAT fields after reset, got %d", (int)line->n_fmt);
+    bcf_destroy(line);
+    bcf_hdr_destroy(hdr);
+    if (hts_close(fp)) error("test_parse_formats: hts_close failed");
+}
+
 void test_invalid_end_tag(void)
 {
     static const char vcf_data[] = "data:,"
@@ -674,5 +749,6 @@ int main(int argc, char **argv)
     test_get_info_values(fname);
     test_invalid_end_tag();
     test_open_format();
+    test_parse_formats();
     return 0;
 }
