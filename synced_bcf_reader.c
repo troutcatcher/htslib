@@ -86,7 +86,7 @@ typedef struct
     // files->p, so sharing it could starve them of worker threads.
     hts_tpool *fill_pool;
     hts_tpool_process *fill_q;
-    int fill_qsize;
+    int fill_nthreads;
     fill_job_t *fill_jobs;
     kstring_t *fill_tmps;
     int nfill;
@@ -256,8 +256,9 @@ int bcf_sr_set_threads(bcf_srs_t *files, int n_threads)
     if (!(files->p->pool = hts_tpool_init(n_threads)))
         return -1;
 
-    if (!(BCF_SR_AUX(files)->fill_pool = hts_tpool_init(n_threads)))
-        return -1;
+    // the fill pool itself is created lazily by _readers_fill_buffers,
+    // so single-reader use does not carry a second, idle pool
+    BCF_SR_AUX(files)->fill_nthreads = n_threads;
 
     return 0;
 }
@@ -644,14 +645,21 @@ static void _set_variant_boundaries(bcf1_t *rec, hts_pos_t *beg, hts_pos_t *end)
  *  parallel (see _readers_fill_buffers); everything else this touches is
  *  either owned by the reader or read-only during the fills.
  */
-static int _reader_fill_buffer(bcf_srs_t *files, bcf_sr_t *reader,
-                               kstring_t *tmps, bcf_sr_error *errnum)
+static int _reader_needs_fill(bcf_srs_t *files, bcf_sr_t *reader)
 {
-    // Return if the buffer is full: the coordinate of the last buffered record differs
+    // The buffer is full when the coordinate of the last buffered record differs
     if ( reader->nbuffer && reader->buffer[reader->nbuffer]->pos != reader->buffer[1]->pos ) return 0;
 
     // No iterator (sequence not present in this file) and not streaming
     if ( !reader->itr && !files->streaming ) return 0;
+
+    return 1;
+}
+
+static int _reader_fill_buffer(bcf_srs_t *files, bcf_sr_t *reader,
+                               kstring_t *tmps, bcf_sr_error *errnum)
+{
+    if ( !_reader_needs_fill(files, reader) ) return 0;
 
     // Fill the buffer with records starting at the same position
     int i, ret = 0;
@@ -763,62 +771,70 @@ static void *_fill_buffer_job(void *arg)
     return j;
 }
 
+static void _fill_buffers_serial(bcf_srs_t *files)
+{
+    int i;
+    for (i=0; i<files->nreaders; i++)
+        _reader_fill_buffer(files, &files->readers[i], &files->tmps, &files->errnum);
+}
+
 /*
  *  _readers_fill_buffers() - fill every reader's buffer, concurrently when
  *  bcf_sr_set_threads was called. The readers are mutually independent, so
- *  each fill runs as one job on the dedicated fill pool; each job gets its
- *  own line buffer and error slot, and files->errnum is only updated after
- *  all jobs have finished.
+ *  each fill runs as one job on the dedicated fill pool; only readers that
+ *  actually need filling are dispatched, each job gets its own line buffer
+ *  and error slot, and files->errnum is updated only after the wave is done.
  */
 static void _readers_fill_buffers(bcf_srs_t *files)
 {
     aux_t *aux = BCF_SR_AUX(files);
-    int i;
-    if ( !aux->fill_pool || files->nreaders < 2 )
+    int i, n_need = 0;
+    for (i=0; i<files->nreaders; i++)
+        n_need += _reader_needs_fill(files, &files->readers[i]);
+
+    // dispatching lone or no-op fills costs more than it saves
+    if ( !aux->fill_nthreads || n_need < 2 )
     {
-        for (i=0; i<files->nreaders; i++)
-            _reader_fill_buffer(files, &files->readers[i], &files->tmps, &files->errnum);
+        _fill_buffers_serial(files);
+        return;
+    }
+    if ( !aux->fill_pool && !(aux->fill_pool = hts_tpool_init(aux->fill_nthreads)) )
+    {
+        aux->fill_nthreads = 0; // don't retry every wave
+        _fill_buffers_serial(files);
         return;
     }
     if ( aux->nfill < files->nreaders )
     {
         fill_job_t *jobs = (fill_job_t*) realloc(aux->fill_jobs, files->nreaders*sizeof(*jobs));
         kstring_t *tmps = (kstring_t*) realloc(aux->fill_tmps, files->nreaders*sizeof(*tmps));
+        if ( jobs ) aux->fill_jobs = jobs;
+        if ( tmps ) aux->fill_tmps = tmps;
         if ( !jobs || !tmps )
         {
-            // fall back to serial filling
-            if ( jobs ) aux->fill_jobs = jobs;
-            if ( tmps ) aux->fill_tmps = tmps;
-            for (i=0; i<files->nreaders; i++)
-                _reader_fill_buffer(files, &files->readers[i], &files->tmps, &files->errnum);
+            _fill_buffers_serial(files);
             return;
         }
         memset(tmps + aux->nfill, 0, (files->nreaders - aux->nfill)*sizeof(*tmps));
-        aux->fill_jobs = jobs;
-        aux->fill_tmps = tmps;
         aux->nfill = files->nreaders;
-    }
-    if ( aux->fill_q && aux->fill_qsize < 2*files->nreaders )
-    {
-        // the queue must hold a whole wave; it is empty between waves
-        hts_tpool_process_destroy(aux->fill_q);
-        aux->fill_q = NULL;
-    }
-    if ( !aux->fill_q )
-    {
-        aux->fill_qsize = 2*files->nreaders + 2;
-        aux->fill_q = hts_tpool_process_init(aux->fill_pool, aux->fill_qsize, 0);
-        if ( !aux->fill_q )
+        if ( aux->fill_q )
         {
-            for (i=0; i<files->nreaders; i++)
-                _reader_fill_buffer(files, &files->readers[i], &files->tmps, &files->errnum);
-            return;
+            // the queue must hold a whole wave; it is empty between waves
+            hts_tpool_process_destroy(aux->fill_q);
+            aux->fill_q = NULL;
         }
+    }
+    if ( !aux->fill_q &&
+         !(aux->fill_q = hts_tpool_process_init(aux->fill_pool, 2*aux->nfill + 2, 0)) )
+    {
+        _fill_buffers_serial(files);
+        return;
     }
     int dispatched = 0;
     for (i=0; i<files->nreaders; i++)
     {
         fill_job_t *j = &aux->fill_jobs[i];
+        if ( !_reader_needs_fill(files, &files->readers[i]) ) continue;
         j->files = files;
         j->reader = &files->readers[i];
         j->tmps = &aux->fill_tmps[i];

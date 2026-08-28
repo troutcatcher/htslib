@@ -2975,7 +2975,7 @@ static int vcf_parse_format_max3(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
                 if (j >= skip_from) {
                     // everything up to the end of the column is skipped
                     char *rr = memchr(r, '\t', end - r);
-                    r = rr ? rr : r + (end - r); // no tab: the final NUL
+                    r = rr ? rr : (char *)end; // no tab: the final NUL
                 } else {
                     r += strcspn(r, ":\t"); // also stops at the final NUL
                 }
@@ -3393,7 +3393,7 @@ static int vcf_parse_format(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
 
     // get format information from the dictionary
     if ((ret = vcf_parse_format_dict2(s, h, v, p, q, fmt, ctx)) < 0)
-        return ret == VCF_PARSE_NEEDS_HDR ? VCF_PARSE_NEEDS_HDR : -1;
+        return ret;
 
     // FORMAT data is per-sample A:B:C A:B:C A:B:C ... but in memory it is
     // stored as per-type arrays AAA... BBB... CCC...  This is basically
@@ -3915,8 +3915,7 @@ typedef struct vcf_mt_batch {
     int serial_from;    // first line needing a writable-header re-parse, or -1
     kstring_t scratch;  // per-batch FORMAT pivot buffer (instead of h->mem)
     kstring_t parse_buf;// per-batch copy of the line being parsed
-    const bcf_hdr_t *h;
-    int max_unpack;
+    struct vcf_mt_state *st; // h and max_unpack are immutable while jobs run
 } vcf_mt_batch;
 
 // Distinguishes our state from foreign objects in fp->state: for VCF text
@@ -3929,7 +3928,6 @@ typedef struct vcf_mt_batch {
 typedef struct vcf_mt_state {
     uint32_t magic;     // VCF_MT_MAGIC
     hts_tpool *pool;
-    int own_pool;
     hts_tpool_process *q;
     htsFile *fp;            // the reader thread's input stream
     const bcf_hdr_t *h;
@@ -3984,8 +3982,8 @@ static void *vcf_mt_parse_batch(void *arg) {
             b->serial_from = i; // out of memory; retry serially
             break;
         }
-        b->recs[i]->max_unpack = b->max_unpack;
-        ret = vcf_parse_ctx1(&b->parse_buf, b->h, b->recs[i], &ctx);
+        b->recs[i]->max_unpack = b->st->max_unpack;
+        ret = vcf_parse_ctx1(&b->parse_buf, b->st->h, b->recs[i], &ctx);
         if (ret == VCF_PARSE_NEEDS_HDR) {
             b->serial_from = i;
             break;
@@ -3998,12 +3996,12 @@ static void *vcf_mt_parse_batch(void *arg) {
 // re-parse lines the frozen-header workers could not handle; only called
 // when neither workers nor the reader thread are running, as this may
 // modify the header
-static void vcf_mt_parse_serial_tail(vcf_mt_batch *b, const bcf_hdr_t *h) {
+static void vcf_mt_parse_serial_tail(vcf_mt_batch *b) {
     int i;
     if (b->serial_from < 0) return;
     for (i = b->serial_from; i < b->n; i++) {
-        b->recs[i]->max_unpack = b->max_unpack;
-        b->rets[i] = vcf_parse(&b->lines[i], h, b->recs[i]);
+        b->recs[i]->max_unpack = b->st->max_unpack;
+        b->rets[i] = vcf_parse(&b->lines[i], b->st->h, b->recs[i]);
     }
     b->serial_from = -1;
 }
@@ -4084,10 +4082,9 @@ static void *vcf_mt_reader(void *arg) {
         pthread_mutex_unlock(&st->mtx);
         if (stop) break;
         if (!b) goto fail;
-        b->h = st->h;
+        b->st = st;
         b->n = 0;
         b->serial_from = -1;
-        b->max_unpack = st->max_unpack;
         while (b->n < VCF_MT_BATCH_LINES && bytes < VCF_MT_BATCH_BYTES) {
             int ret;
             if (b->n == b->m) {
@@ -4224,9 +4221,9 @@ static int vcf_read_mt(htsFile *fp, const bcf_hdr_t *h, bcf1_t *v,
                     vcf_mt_batch_destroy(b);
                     return -2;
                 }
-                vcf_mt_parse_serial_tail(b, h);
+                vcf_mt_parse_serial_tail(b);
                 for (i = st->backlog_head; i < st->n_backlog; i++)
-                    vcf_mt_parse_serial_tail(st->backlog[i], h);
+                    vcf_mt_parse_serial_tail(st->backlog[i]);
                 if (vcf_mt_reader_start(st) < 0) {
                     vcf_mt_batch_destroy(b);
                     return -2;
@@ -4245,14 +4242,13 @@ int bcf_set_parse_threads(htsFile *fp, int nthreads)
         return -1;
     if (nthreads <= 0)
         return 0;
-    if (fp->state) // already enabled
+    if (fp->state) // already enabled, or a foreign object (see VCF_MT_MAGIC)
         return -1;
     st = (vcf_mt_state *)calloc(1, sizeof(*st));
     if (!st) return -1;
     st->magic = VCF_MT_MAGIC;
     st->pool = hts_tpool_init(nthreads);
     if (!st->pool) { free(st); return -1; }
-    st->own_pool = 1;
     st->q = hts_tpool_process_init(st->pool, 2 * nthreads + 2, 0);
     if (!st->q) { hts_tpool_destroy(st->pool); free(st); return -1; }
     pthread_mutex_init(&st->mtx, NULL);
@@ -4284,7 +4280,7 @@ void vcf_state_destroy(htsFile *fp)
         vcf_mt_batch_destroy(st->freelist[i]);
     free(st->freelist);
     hts_tpool_process_destroy(st->q);
-    if (st->own_pool) hts_tpool_destroy(st->pool);
+    hts_tpool_destroy(st->pool);
     pthread_cond_destroy(&st->cv);
     pthread_mutex_destroy(&st->mtx);
     free(st);
