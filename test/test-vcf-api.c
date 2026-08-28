@@ -637,6 +637,80 @@ void test_parse_formats(void)
     if (hts_close(fp)) error("test_parse_formats: hts_close failed");
 }
 
+#define MT_TEST_RECS 3000
+
+void test_parse_threads(void)
+{
+    const char *fname = "rmme_parse_mt.vcf";
+    int i;
+    FILE *f = fopen(fname, "w");
+    if (!f) error("test_parse_threads: failed to create %s", fname);
+    fputs("##fileformat=VCFv4.2\n"
+          "##contig=<ID=1,length=100000>\n" // contig 2 deliberately undeclared
+          "##INFO=<ID=AF,Number=A,Type=Float,Description=\"AF\">\n"
+          "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n"
+          "##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Depth\">\n"
+          "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\n", f);
+    for (i = 0; i < MT_TEST_RECS; i++) {
+        // an undeclared contig halfway and an undeclared INFO tag later on
+        // exercise the drain + writable-header re-parse path
+        fprintf(f, "%d\t%d\t.\tA\tT\t.\t.\t%s\tGT:DP\t0|1:%d\t1/1:%d\t./.:%d\n",
+                i < MT_TEST_RECS/2 ? 1 : 2, i + 1,
+                i == 2000 ? "XY=3" : "AF=0.5",
+                i, i + 1, i + 2);
+    }
+    if (fclose(f)) error("test_parse_threads: failed to write %s", fname);
+
+    // reference: serial read
+    static int rids[MT_TEST_RECS], nfmts[MT_TEST_RECS];
+    static hts_pos_t poss[MT_TEST_RECS];
+    static int64_t gtsums[MT_TEST_RECS];
+    htsFile *fp = hts_open(fname, "r");
+    bcf_hdr_t *hdr = bcf_hdr_read(fp);
+    bcf1_t *line = bcf_init();
+    int32_t *gt = NULL;
+    int ngt = 0, n = 0;
+    while (n < MT_TEST_RECS && bcf_read(fp, hdr, line) >= 0) {
+        int j, nv = bcf_get_genotypes(hdr, line, &gt, &ngt);
+        rids[n] = line->rid;
+        poss[n] = line->pos;
+        nfmts[n] = line->n_fmt;
+        gtsums[n] = 0;
+        for (j = 0; j < nv; j++) gtsums[n] += gt[j];
+        n++;
+    }
+    if (n != MT_TEST_RECS)
+        error("test_parse_threads: serial read returned %d records", n);
+    bcf_destroy(line);
+    bcf_hdr_destroy(hdr);
+    hts_close(fp);
+
+    // threaded read must produce the same records in the same order
+    fp = hts_open(fname, "r");
+    hdr = bcf_hdr_read(fp);
+    check0(bcf_set_parse_threads(fp, 2));
+    line = bcf_init();
+    n = 0;
+    while (n < MT_TEST_RECS && bcf_read(fp, hdr, line) >= 0) {
+        int j, nv = bcf_get_genotypes(hdr, line, &gt, &ngt);
+        int64_t gtsum = 0;
+        for (j = 0; j < nv; j++) gtsum += gt[j];
+        if (line->rid != rids[n] || line->pos != poss[n] ||
+            (int)line->n_fmt != nfmts[n] || gtsum != gtsums[n])
+            error("test_parse_threads: record %d differs between serial and threaded reads", n);
+        n++;
+    }
+    if (n != MT_TEST_RECS)
+        error("test_parse_threads: threaded read returned %d records", n);
+    if (bcf_read(fp, hdr, line) != -1)
+        error("test_parse_threads: expected EOF after %d records", n);
+    free(gt);
+    bcf_destroy(line);
+    bcf_hdr_destroy(hdr);
+    hts_close(fp);
+    remove(fname);
+}
+
 void test_invalid_end_tag(void)
 {
     static const char vcf_data[] = "data:,"
@@ -750,5 +824,6 @@ int main(int argc, char **argv)
     test_invalid_end_tag();
     test_open_format();
     test_parse_formats();
+    test_parse_threads();
     return 0;
 }

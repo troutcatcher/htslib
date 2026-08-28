@@ -146,6 +146,10 @@ static inline int find_file_extension(const char *fn, char ext_out[static HTS_MA
     return 0;
 }
 
+// Frees the threaded VCF parsing state hanging off fp->state, if any
+// (see bcf_set_parse_threads in vcf.c). Waits for in-flight parse jobs.
+void vcf_state_destroy(htsFile *fp);
+
 #ifdef __cplusplus
 }
 #endif

@@ -368,6 +368,29 @@ typedef struct bcf1_t {
     int bcf_subset_format(const bcf_hdr_t *hdr, bcf1_t *rec);
 
     /**
+     *  bcf_set_parse_threads() - parse VCF text with a pool of worker threads
+     *  @param fp        VCF file opened for reading
+     *  @param nthreads  number of worker threads (> 0)
+     *
+     *  After this call, bcf_read()/vcf_read() on @p fp reads batches of lines
+     *  ahead and parses them on @p nthreads worker threads, returning records
+     *  in file order. This parallelizes vcf_parse(), which usually dominates
+     *  reading VCF text; it is independent of (and composes with) the BGZF
+     *  decompression threads enabled by hts_set_threads(). Lines that require
+     *  a header modification (tags or contigs not declared in the header) are
+     *  transparently re-parsed serially.
+     *
+     *  Only sequential reading through bcf_read() is threaded; iterator-based
+     *  (indexed) reads are unaffected. Because reading runs ahead of the
+     *  returned records, a caller must not mix bcf_read() with direct seeks
+     *  on the same file handle. Only supported for VCF text (including
+     *  compressed); returns -1 for other formats, files opened for writing,
+     *  or when already enabled; 0 on success (nthreads <= 0 is a no-op).
+     */
+    HTSLIB_EXPORT
+    int bcf_set_parse_threads(htsFile *fp, int nthreads);
+
+    /**
      *  bcf_hdr_set_parse_formats() - restrict VCF text parsing to given FORMAT fields
      *  @param fmts  comma-separated list of FORMAT field names to parse
      *               (e.g. "GT" or "GT,DP"), or NULL to restore parsing of

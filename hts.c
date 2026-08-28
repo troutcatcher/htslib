@@ -1626,6 +1626,8 @@ int hts_close(htsFile *fp)
     case vcf:
         if (fp->format.format == sam)
             ret = sam_state_destroy(fp);
+        else if (fp->format.format == vcf)
+            vcf_state_destroy(fp);
         else if (fp->format.format == fastq_format ||
                  fp->format.format == fasta_format)
             fastq_state_destroy(fp);
