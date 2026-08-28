@@ -52,6 +52,7 @@ DEALINGS IN THE SOFTWARE.  */
 #include "htslib/sam.h"
 #include "htslib/khash.h"
 #include "htslib/thread_pool.h"
+#include <pthread.h>
 
 #if 0
 // This helps on Intel a bit, often 6-7% faster VCF parsing.
@@ -3893,14 +3894,17 @@ int vcf_open_mode(char *mode, const char *fn, const char *format)
 /*
  * Threaded parsing of VCF text (bcf_set_parse_threads).
  *
- * The reader thread (the caller of vcf_read) reads batches of lines and
- * dispatches them to a thread pool; workers run vcf_parse_ctx1 with a frozen
- * header and a per-batch scratch buffer, so they share the header strictly
- * read-only. Results come back in dispatch order. When a line needs a header
- * modification (an undeclared tag or contig), the worker stops, the reader
- * drains all in-flight batches and re-parses the affected lines serially
- * with a writable header, then resumes threaded parsing. Workers parse a
- * copy of each line so the pristine text is available for that re-parse.
+ * A dedicated reader thread reads batches of lines and dispatches them to a
+ * thread pool; workers run vcf_parse_ctx1 with a frozen header and a
+ * per-batch scratch buffer, so they share the header strictly read-only,
+ * and results come back in dispatch order. The consumer (the caller of
+ * vcf_read) only collects parsed records, so line reading and decompression
+ * overlap with both parsing and the caller's own work. When a line needs a
+ * header modification (an undeclared tag or contig), the worker stops; the
+ * consumer then parks the reader thread, drains all in-flight batches,
+ * re-parses the affected lines serially with a writable header while
+ * nothing else runs, and restarts the reader. Workers parse a copy of each
+ * line so the pristine text is available for that re-parse.
  */
 
 typedef struct vcf_mt_batch {
@@ -3919,17 +3923,26 @@ typedef struct vcf_mt_state {
     hts_tpool *pool;
     int own_pool;
     hts_tpool_process *q;
-    int in_flight;      // batches dispatched but not yet retrieved
-    int depth;          // max batches in flight
-    vcf_mt_batch *cur;  // batch currently handed out record by record
+    htsFile *fp;            // the reader thread's input stream
+    const bcf_hdr_t *h;
+    // shared between the reader thread and the consumer, guarded by mtx
+    pthread_mutex_t mtx;
+    pthread_cond_t cv;
+    int in_flight;          // batches dispatched but not yet retrieved
+    int eof;
+    int io_error;           // sticky hts_getline or allocation error
+    int stop_req;           // ask the reader thread to park
+    int reader_running;
+    vcf_mt_batch **freelist;
+    int n_free, m_free;
+    int max_unpack;         // propagated from the caller's records
+    // consumer-only state
+    int reader_started;
+    pthread_t reader;
+    vcf_mt_batch *cur;      // batch currently handed out record by record
     int cur_i;
     vcf_mt_batch **backlog; // drained batches not yet consumed, in order
     int n_backlog, backlog_head, m_backlog;
-    vcf_mt_batch **freelist;
-    int n_free, m_free;
-    int eof;
-    int io_error;       // sticky hts_getline error (< -1)
-    int max_unpack;     // propagated from the caller's records
 } vcf_mt_state;
 
 #define VCF_MT_BATCH_LINES 512
@@ -3975,7 +3988,8 @@ static void *vcf_mt_parse_batch(void *arg) {
 }
 
 // re-parse lines the frozen-header workers could not handle; only called
-// when no worker is running, as this may modify the header
+// when neither workers nor the reader thread are running, as this may
+// modify the header
 static void vcf_mt_parse_serial_tail(vcf_mt_batch *b, const bcf_hdr_t *h) {
     int i;
     if (b->serial_from < 0) return;
@@ -3986,6 +4000,7 @@ static void vcf_mt_parse_serial_tail(vcf_mt_batch *b, const bcf_hdr_t *h) {
     b->serial_from = -1;
 }
 
+// take a batch from the freelist; call with st->mtx held
 static vcf_mt_batch *vcf_mt_get_batch(vcf_mt_state *st) {
     vcf_mt_batch *b;
     if (st->n_free > 0) return st->freelist[--st->n_free];
@@ -3993,6 +4008,7 @@ static vcf_mt_batch *vcf_mt_get_batch(vcf_mt_state *st) {
     return b;
 }
 
+// return a batch to the freelist; call with st->mtx held
 static int vcf_mt_release_batch(vcf_mt_state *st, vcf_mt_batch *b) {
     if (st->n_free == st->m_free) {
         int m = st->m_free ? st->m_free * 2 : 8;
@@ -4005,15 +4021,32 @@ static int vcf_mt_release_batch(vcf_mt_state *st, vcf_mt_batch *b) {
     return 0;
 }
 
-// pop one finished batch, in dispatch order
+// pop one finished batch, in dispatch order; call only when a batch has
+// been dispatched (in_flight > 0)
 static vcf_mt_batch *vcf_mt_next_batch(vcf_mt_state *st) {
     hts_tpool_result *r = hts_tpool_next_result_wait(st->q);
     vcf_mt_batch *b;
     if (!r) return NULL;
     b = (vcf_mt_batch *)hts_tpool_result_data(r);
     hts_tpool_delete_result(r, 0);
+    pthread_mutex_lock(&st->mtx);
     st->in_flight--;
+    pthread_mutex_unlock(&st->mtx);
     return b;
+}
+
+// wait until a parsed batch is available and pop it; NULL means no more
+// batches will arrive (end of file, error, or the reader has parked)
+static vcf_mt_batch *vcf_mt_wait_batch(vcf_mt_state *st) {
+    pthread_mutex_lock(&st->mtx);
+    while (st->in_flight == 0 && st->reader_running)
+        pthread_cond_wait(&st->cv, &st->mtx);
+    if (st->in_flight == 0) {
+        pthread_mutex_unlock(&st->mtx);
+        return NULL;
+    }
+    pthread_mutex_unlock(&st->mtx);
+    return vcf_mt_next_batch(st);
 }
 
 static int vcf_mt_backlog_push(vcf_mt_state *st, vcf_mt_batch *b) {
@@ -4028,29 +4061,22 @@ static int vcf_mt_backlog_push(vcf_mt_state *st, vcf_mt_batch *b) {
     return 0;
 }
 
-// a batch needed a header modification: wait for every in-flight batch,
-// then do the writable-header re-parses while no worker is running
-static int vcf_mt_drain_and_fix(vcf_mt_state *st, vcf_mt_batch *first,
-                                const bcf_hdr_t *h) {
-    int i;
-    while (st->in_flight > 0) {
-        vcf_mt_batch *b = vcf_mt_next_batch(st);
-        if (!b) return -1;
-        if (vcf_mt_backlog_push(st, b) < 0) { vcf_mt_batch_destroy(b); return -1; }
-    }
-    vcf_mt_parse_serial_tail(first, h);
-    for (i = st->backlog_head; i < st->n_backlog; i++)
-        vcf_mt_parse_serial_tail(st->backlog[i], h);
-    return 0;
-}
-
-// read lines and dispatch parse jobs until the pipeline is full
-static int vcf_mt_fill(htsFile *fp, const bcf_hdr_t *h, vcf_mt_state *st) {
-    while (!st->eof && st->in_flight < st->depth) {
-        vcf_mt_batch *b = vcf_mt_get_batch(st);
+// the dedicated reader thread: reads batches of lines and dispatches them
+// to the parse workers until end of file, error, or a stop request; the
+// thread pool's bounded queue provides the backpressure
+static void *vcf_mt_reader(void *arg) {
+    vcf_mt_state *st = (vcf_mt_state *)arg;
+    for (;;) {
+        vcf_mt_batch *b;
         size_t bytes = 0;
-        if (!b) return -1;
-        b->h = h;
+        int stop;
+        pthread_mutex_lock(&st->mtx);
+        stop = st->stop_req || st->eof || st->io_error;
+        b = stop ? NULL : vcf_mt_get_batch(st);
+        pthread_mutex_unlock(&st->mtx);
+        if (stop) break;
+        if (!b) goto fail;
+        b->h = st->h;
         b->n = 0;
         b->serial_from = -1;
         b->max_unpack = st->max_unpack;
@@ -4059,77 +4085,146 @@ static int vcf_mt_fill(htsFile *fp, const bcf_hdr_t *h, vcf_mt_state *st) {
             if (b->n == b->m) {
                 int m = b->m ? b->m * 2 : 64;
                 kstring_t *lines = (kstring_t *)realloc(b->lines, m * sizeof(*lines));
-                if (!lines) goto fail;
+                if (!lines) goto fail_b;
                 memset(lines + b->m, 0, (m - b->m) * sizeof(*lines));
                 b->lines = lines;
                 bcf1_t **recs = (bcf1_t **)realloc(b->recs, m * sizeof(*recs));
-                if (!recs) goto fail;
+                if (!recs) goto fail_b;
                 memset(recs + b->m, 0, (m - b->m) * sizeof(*recs));
                 b->recs = recs;
                 int *rets = (int *)realloc(b->rets, m * sizeof(*rets));
-                if (!rets) goto fail;
+                if (!rets) goto fail_b;
                 b->rets = rets;
                 b->m = m;
             }
-            ret = hts_getline(fp, KS_SEP_LINE, &b->lines[b->n]);
+            ret = hts_getline(st->fp, KS_SEP_LINE, &b->lines[b->n]);
             if (ret < 0) {
+                pthread_mutex_lock(&st->mtx);
                 st->eof = 1;
                 if (ret < -1) st->io_error = ret;
+                pthread_mutex_unlock(&st->mtx);
                 break;
             }
             if (!b->recs[b->n] && !(b->recs[b->n] = bcf_init()))
-                goto fail;
+                goto fail_b;
             bytes += b->lines[b->n].l;
             b->n++;
         }
         if (b->n == 0) {
-            if (vcf_mt_release_batch(st, b) < 0) return -1;
+            pthread_mutex_lock(&st->mtx);
+            vcf_mt_release_batch(st, b);
+            pthread_mutex_unlock(&st->mtx);
             break;
         }
+        // may block waiting for queue space; the consumer popping results
+        // frees it, so this cannot deadlock
         if (hts_tpool_dispatch(st->pool, st->q, vcf_mt_parse_batch, b) < 0)
-            goto fail;
+            goto fail_b;
+        pthread_mutex_lock(&st->mtx);
         st->in_flight++;
+        pthread_cond_signal(&st->cv);
+        pthread_mutex_unlock(&st->mtx);
         continue;
-    fail:
+    fail_b:
         vcf_mt_batch_destroy(b);
+    fail:
+        pthread_mutex_lock(&st->mtx);
+        st->io_error = -2;
+        pthread_mutex_unlock(&st->mtx);
+        break;
+    }
+    pthread_mutex_lock(&st->mtx);
+    st->reader_running = 0;
+    pthread_cond_broadcast(&st->cv);
+    pthread_mutex_unlock(&st->mtx);
+    return NULL;
+}
+
+static int vcf_mt_reader_start(vcf_mt_state *st) {
+    // no reader is running here, so eof/io_error cannot change concurrently
+    if (st->reader_started || st->eof || st->io_error)
+        return 0;
+    st->stop_req = 0;
+    st->reader_running = 1;
+    if (pthread_create(&st->reader, NULL, vcf_mt_reader, st) != 0) {
+        st->reader_running = 0;
         return -1;
     }
+    st->reader_started = 1;
+    return 0;
+}
+
+// park the reader thread and move every in-flight batch to the backlog, so
+// the consumer can safely re-parse lines with a writable header
+static int vcf_mt_reader_stop(vcf_mt_state *st) {
+    vcf_mt_batch *b;
+    pthread_mutex_lock(&st->mtx);
+    st->stop_req = 1;
+    pthread_mutex_unlock(&st->mtx);
+    while ((b = vcf_mt_wait_batch(st)) != NULL) {
+        if (vcf_mt_backlog_push(st, b) < 0) {
+            vcf_mt_batch_destroy(b);
+            return -1;
+        }
+    }
+    pthread_join(st->reader, NULL);
+    st->reader_started = 0;
+    st->stop_req = 0;
     return 0;
 }
 
 static int vcf_read_mt(htsFile *fp, const bcf_hdr_t *h, bcf1_t *v,
                        vcf_mt_state *st) {
+    int ret, i;
+    if (!st->reader_started && !st->eof && !st->io_error) {
+        st->fp = fp;
+        st->h = h;
+        st->max_unpack = v->max_unpack;
+        if (vcf_mt_reader_start(st) < 0) return -2;
+    }
     for (;;) {
         if (st->cur) {
             if (st->cur_i < st->cur->n) {
                 vcf_mt_batch *b = st->cur;
-                int i = st->cur_i++;
                 bcf1_t tmp = *v;
+                i = st->cur_i++;
                 *v = *b->recs[i];
                 *b->recs[i] = tmp;
                 return b->rets[i];
             }
-            if (vcf_mt_release_batch(st, st->cur) < 0) { st->cur = NULL; return -2; }
+            pthread_mutex_lock(&st->mtx);
+            ret = vcf_mt_release_batch(st, st->cur);
+            pthread_mutex_unlock(&st->mtx);
             st->cur = NULL;
+            if (ret < 0) return -2;
         }
-
-        st->max_unpack = v->max_unpack;
-        if (vcf_mt_fill(fp, h, st) < 0) return -2;
 
         if (st->backlog_head < st->n_backlog) {
             st->cur = st->backlog[st->backlog_head++];
             if (st->backlog_head == st->n_backlog)
                 st->backlog_head = st->n_backlog = 0;
-        } else if (st->in_flight > 0) {
-            vcf_mt_batch *b = vcf_mt_next_batch(st);
-            if (!b) return -2;
-            if (b->serial_from >= 0 && vcf_mt_drain_and_fix(st, b, h) < 0) {
-                vcf_mt_batch_destroy(b);
-                return -2;
+        } else {
+            vcf_mt_batch *b = vcf_mt_wait_batch(st);
+            if (!b) {
+                pthread_mutex_lock(&st->mtx);
+                ret = st->io_error;
+                pthread_mutex_unlock(&st->mtx);
+                return ret ? ret : -1; // end of file
+            }
+            if (b->serial_from >= 0) {
+                if (vcf_mt_reader_stop(st) < 0) {
+                    vcf_mt_batch_destroy(b);
+                    return -2;
+                }
+                vcf_mt_parse_serial_tail(b, h);
+                for (i = st->backlog_head; i < st->n_backlog; i++)
+                    vcf_mt_parse_serial_tail(st->backlog[i], h);
+                if (vcf_mt_reader_start(st) < 0) {
+                    vcf_mt_batch_destroy(b);
+                    return -2;
+                }
             }
             st->cur = b;
-        } else {
-            return st->io_error ? st->io_error : -1; // end of file
         }
         st->cur_i = 0;
     }
@@ -4149,9 +4244,10 @@ int bcf_set_parse_threads(htsFile *fp, int nthreads)
     st->pool = hts_tpool_init(nthreads);
     if (!st->pool) { free(st); return -1; }
     st->own_pool = 1;
-    st->depth = 2 * nthreads + 1;
-    st->q = hts_tpool_process_init(st->pool, 2 * st->depth, 0);
+    st->q = hts_tpool_process_init(st->pool, 2 * nthreads + 2, 0);
     if (!st->q) { hts_tpool_destroy(st->pool); free(st); return -1; }
+    pthread_mutex_init(&st->mtx, NULL);
+    pthread_cond_init(&st->cv, NULL);
     fp->state = st;
     return 0;
 }
@@ -4159,12 +4255,17 @@ int bcf_set_parse_threads(htsFile *fp, int nthreads)
 void vcf_state_destroy(htsFile *fp)
 {
     vcf_mt_state *st = (vcf_mt_state *)fp->state;
+    vcf_mt_batch *b;
     int i;
     if (!st) return;
-    while (st->in_flight > 0) {
-        vcf_mt_batch *b = vcf_mt_next_batch(st);
-        if (!b) break;
-        vcf_mt_batch_destroy(b);
+    if (st->reader_started) {
+        pthread_mutex_lock(&st->mtx);
+        st->stop_req = 1;
+        pthread_mutex_unlock(&st->mtx);
+        while ((b = vcf_mt_wait_batch(st)) != NULL)
+            vcf_mt_batch_destroy(b);
+        pthread_join(st->reader, NULL);
+        st->reader_started = 0;
     }
     if (st->cur) vcf_mt_batch_destroy(st->cur);
     for (i = st->backlog_head; i < st->n_backlog; i++)
@@ -4175,6 +4276,8 @@ void vcf_state_destroy(htsFile *fp)
     free(st->freelist);
     hts_tpool_process_destroy(st->q);
     if (st->own_pool) hts_tpool_destroy(st->pool);
+    pthread_cond_destroy(&st->cv);
+    pthread_mutex_destroy(&st->mtx);
     free(st);
     fp->state = NULL;
 }
