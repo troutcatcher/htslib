@@ -64,10 +64,32 @@ typedef struct bcf_sr_region_t
 region_t;
 
 #define BCF_SR_AUX(x) ((aux_t*)((x)->aux))
+
+// one parallel buffer-fill job (see _readers_fill_buffers)
+typedef struct
+{
+    struct bcf_srs_t *files;
+    bcf_sr_t *reader;
+    kstring_t *tmps;
+    bcf_sr_error errnum;
+}
+fill_job_t;
+
 typedef struct
 {
     sr_sort_t sort;
     int regions_overlap, targets_overlap;
+    // parallel filling of the readers' buffers (bcf_sr_set_threads): the
+    // readers are independent (own stream, header, index and buffer), so
+    // their fills can run concurrently. A pool separate from files->p is
+    // required: fills block on BGZF reads whose decompression jobs run on
+    // files->p, so sharing it could starve them of worker threads.
+    hts_tpool *fill_pool;
+    hts_tpool_process *fill_q;
+    int fill_qsize;
+    fill_job_t *fill_jobs;
+    kstring_t *fill_tmps;
+    int nfill;
 }
 aux_t;
 
@@ -234,10 +256,31 @@ int bcf_sr_set_threads(bcf_srs_t *files, int n_threads)
     if (!(files->p->pool = hts_tpool_init(n_threads)))
         return -1;
 
+    if (!(BCF_SR_AUX(files)->fill_pool = hts_tpool_init(n_threads)))
+        return -1;
+
     return 0;
 }
 
 void bcf_sr_destroy_threads(bcf_srs_t *files) {
+    aux_t *aux = BCF_SR_AUX(files);
+    if (aux) {
+        int i;
+        if (aux->fill_q)
+            hts_tpool_process_destroy(aux->fill_q);
+        if (aux->fill_pool)
+            hts_tpool_destroy(aux->fill_pool);
+        for (i = 0; i < aux->nfill; i++)
+            free(aux->fill_tmps[i].s);
+        free(aux->fill_tmps);
+        free(aux->fill_jobs);
+        aux->fill_pool = NULL;
+        aux->fill_q = NULL;
+        aux->fill_tmps = NULL;
+        aux->fill_jobs = NULL;
+        aux->nfill = 0;
+    }
+
     if (!files->p)
         return;
 
@@ -596,9 +639,13 @@ static void _set_variant_boundaries(bcf1_t *rec, hts_pos_t *beg, hts_pos_t *end)
 }
 
 /*
- *  _reader_fill_buffer() - buffers all records with the same coordinate
+ *  _reader_fill_buffer() - buffers all records with the same coordinate.
+ *  tmps and errnum must be private to the caller when fills run in
+ *  parallel (see _readers_fill_buffers); everything else this touches is
+ *  either owned by the reader or read-only during the fills.
  */
-static int _reader_fill_buffer(bcf_srs_t *files, bcf_sr_t *reader)
+static int _reader_fill_buffer(bcf_srs_t *files, bcf_sr_t *reader,
+                               kstring_t *tmps, bcf_sr_error *errnum)
 {
     // Return if the buffer is full: the coordinate of the last buffered record differs
     if ( reader->nbuffer && reader->buffer[reader->nbuffer]->pos != reader->buffer[1]->pos ) return 0;
@@ -626,16 +673,16 @@ static int _reader_fill_buffer(bcf_srs_t *files, bcf_sr_t *reader)
         {
             if ( reader->file->format.format==vcf )
             {
-                ret = hts_getline(reader->file, KS_SEP_LINE, &files->tmps);
-                if ( ret < -1 ) files->errnum = bcf_read_error;
+                ret = hts_getline(reader->file, KS_SEP_LINE, tmps);
+                if ( ret < -1 ) *errnum = bcf_read_error;
                 if ( ret < 0 ) break; // no more lines or an error
-                ret = vcf_parse1(&files->tmps, reader->header, reader->buffer[reader->nbuffer+1]);
-                if ( ret<0 ) { files->errnum = vcf_parse_error; break; }
+                ret = vcf_parse1(tmps, reader->header, reader->buffer[reader->nbuffer+1]);
+                if ( ret<0 ) { *errnum = vcf_parse_error; break; }
             }
             else if ( reader->file->format.format==bcf )
             {
                 ret = bcf_read1(reader->file, reader->header, reader->buffer[reader->nbuffer+1]);
-                if ( ret < -1 ) files->errnum = bcf_read_error;
+                if ( ret < -1 ) *errnum = bcf_read_error;
                 if ( ret < 0 ) break; // no more lines or an error
             }
             else
@@ -646,16 +693,16 @@ static int _reader_fill_buffer(bcf_srs_t *files, bcf_sr_t *reader)
         }
         else if ( reader->tbx_idx )
         {
-            ret = tbx_itr_next(reader->file, reader->tbx_idx, reader->itr, &files->tmps);
-            if ( ret < -1 ) files->errnum = bcf_read_error;
+            ret = tbx_itr_next(reader->file, reader->tbx_idx, reader->itr, tmps);
+            if ( ret < -1 ) *errnum = bcf_read_error;
             if ( ret < 0 ) break; // no more lines or an error
-            ret = vcf_parse1(&files->tmps, reader->header, reader->buffer[reader->nbuffer+1]);
-            if ( ret<0 ) { files->errnum = vcf_parse_error; break; }
+            ret = vcf_parse1(tmps, reader->header, reader->buffer[reader->nbuffer+1]);
+            if ( ret<0 ) { *errnum = vcf_parse_error; break; }
         }
         else
         {
             ret = bcf_itr_next(reader->file, reader->itr, reader->buffer[reader->nbuffer+1]);
-            if ( ret < -1 ) files->errnum = bcf_read_error;
+            if ( ret < -1 ) *errnum = bcf_read_error;
             if ( ret < 0 ) break; // no more lines or an error
             bcf_subset_format(reader->header,reader->buffer[reader->nbuffer+1]);
         }
@@ -709,6 +756,93 @@ static int _reader_fill_buffer(bcf_srs_t *files, bcf_sr_t *reader)
     return 0; // FIXME: Check for more errs in this function
 }
 
+static void *_fill_buffer_job(void *arg)
+{
+    fill_job_t *j = (fill_job_t *)arg;
+    _reader_fill_buffer(j->files, j->reader, j->tmps, &j->errnum);
+    return j;
+}
+
+/*
+ *  _readers_fill_buffers() - fill every reader's buffer, concurrently when
+ *  bcf_sr_set_threads was called. The readers are mutually independent, so
+ *  each fill runs as one job on the dedicated fill pool; each job gets its
+ *  own line buffer and error slot, and files->errnum is only updated after
+ *  all jobs have finished.
+ */
+static void _readers_fill_buffers(bcf_srs_t *files)
+{
+    aux_t *aux = BCF_SR_AUX(files);
+    int i;
+    if ( !aux->fill_pool || files->nreaders < 2 )
+    {
+        for (i=0; i<files->nreaders; i++)
+            _reader_fill_buffer(files, &files->readers[i], &files->tmps, &files->errnum);
+        return;
+    }
+    if ( aux->nfill < files->nreaders )
+    {
+        fill_job_t *jobs = (fill_job_t*) realloc(aux->fill_jobs, files->nreaders*sizeof(*jobs));
+        kstring_t *tmps = (kstring_t*) realloc(aux->fill_tmps, files->nreaders*sizeof(*tmps));
+        if ( !jobs || !tmps )
+        {
+            // fall back to serial filling
+            if ( jobs ) aux->fill_jobs = jobs;
+            if ( tmps ) aux->fill_tmps = tmps;
+            for (i=0; i<files->nreaders; i++)
+                _reader_fill_buffer(files, &files->readers[i], &files->tmps, &files->errnum);
+            return;
+        }
+        memset(tmps + aux->nfill, 0, (files->nreaders - aux->nfill)*sizeof(*tmps));
+        aux->fill_jobs = jobs;
+        aux->fill_tmps = tmps;
+        aux->nfill = files->nreaders;
+    }
+    if ( aux->fill_q && aux->fill_qsize < 2*files->nreaders )
+    {
+        // the queue must hold a whole wave; it is empty between waves
+        hts_tpool_process_destroy(aux->fill_q);
+        aux->fill_q = NULL;
+    }
+    if ( !aux->fill_q )
+    {
+        aux->fill_qsize = 2*files->nreaders + 2;
+        aux->fill_q = hts_tpool_process_init(aux->fill_pool, aux->fill_qsize, 0);
+        if ( !aux->fill_q )
+        {
+            for (i=0; i<files->nreaders; i++)
+                _reader_fill_buffer(files, &files->readers[i], &files->tmps, &files->errnum);
+            return;
+        }
+    }
+    int dispatched = 0;
+    for (i=0; i<files->nreaders; i++)
+    {
+        fill_job_t *j = &aux->fill_jobs[i];
+        j->files = files;
+        j->reader = &files->readers[i];
+        j->tmps = &aux->fill_tmps[i];
+        j->errnum = 0;
+        if ( hts_tpool_dispatch(aux->fill_pool, aux->fill_q, _fill_buffer_job, j) < 0 )
+        {
+            // should not happen; run this one inline so nothing is skipped
+            _fill_buffer_job(j);
+            if ( j->errnum && !files->errnum ) files->errnum = j->errnum;
+            continue;
+        }
+        dispatched++;
+    }
+    for (i=0; i<dispatched; i++)
+    {
+        hts_tpool_result *r = hts_tpool_next_result_wait(aux->fill_q);
+        fill_job_t *j;
+        if ( !r ) break;
+        j = (fill_job_t*) hts_tpool_result_data(r);
+        hts_tpool_delete_result(r, 0);
+        if ( j->errnum && !files->errnum ) files->errnum = j->errnum;
+    }
+}
+
 /*
  *  _readers_shift_buffer() - removes the first line
  */
@@ -735,11 +869,12 @@ static int next_line(bcf_srs_t *files)
         // Get all readers ready for the next region.
         if ( files->regions && _readers_next_region(files)<0 ) break;
 
-        // Fill buffers and find the minimum chromosome
+        // Fill buffers (concurrently with bcf_sr_set_threads) and find the
+        // minimum chromosome
         int i, min_rid = INT32_MAX;
+        _readers_fill_buffers(files);
         for (i=0; i<files->nreaders; i++)
         {
-            _reader_fill_buffer(files, &files->readers[i]);
             if ( files->require_index==ALLOW_NO_IDX_ )
             {
                 if ( !files->readers[i].nbuffer ) continue;
