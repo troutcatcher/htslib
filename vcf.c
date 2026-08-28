@@ -3919,7 +3919,15 @@ typedef struct vcf_mt_batch {
     int max_unpack;
 } vcf_mt_batch;
 
+// Distinguishes our state from foreign objects in fp->state: for VCF text
+// output opened as "w"/"wz" the format starts out as text_format, so
+// hts_set_thread_pool stores a SAM_state there before vcf_hdr_write flips
+// the format to vcf. Guarding on the magic keeps vcf_read/vcf_state_destroy
+// from misinterpreting it (upstream leaks that object; so do we).
+#define VCF_MT_MAGIC 0x63764d54u
+
 typedef struct vcf_mt_state {
+    uint32_t magic;     // VCF_MT_MAGIC
     hts_tpool *pool;
     int own_pool;
     hts_tpool_process *q;
@@ -4241,6 +4249,7 @@ int bcf_set_parse_threads(htsFile *fp, int nthreads)
         return -1;
     st = (vcf_mt_state *)calloc(1, sizeof(*st));
     if (!st) return -1;
+    st->magic = VCF_MT_MAGIC;
     st->pool = hts_tpool_init(nthreads);
     if (!st->pool) { free(st); return -1; }
     st->own_pool = 1;
@@ -4257,7 +4266,7 @@ void vcf_state_destroy(htsFile *fp)
     vcf_mt_state *st = (vcf_mt_state *)fp->state;
     vcf_mt_batch *b;
     int i;
-    if (!st) return;
+    if (!st || st->magic != VCF_MT_MAGIC) return;
     if (st->reader_started) {
         pthread_mutex_lock(&st->mtx);
         st->stop_req = 1;
@@ -4285,7 +4294,7 @@ void vcf_state_destroy(htsFile *fp)
 int vcf_read(htsFile *fp, const bcf_hdr_t *h, bcf1_t *v)
 {
     int ret;
-    if (fp->state)
+    if (fp->state && ((vcf_mt_state *)fp->state)->magic == VCF_MT_MAGIC)
         return vcf_read_mt(fp, h, v, (vcf_mt_state *)fp->state);
     ret = hts_getline(fp, KS_SEP_LINE, &fp->line);
     if (ret < 0) return ret;
