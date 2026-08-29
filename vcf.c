@@ -3142,10 +3142,13 @@ static int vcf_parse_format_alloc4(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
 // only a guess, so every write is capped by the field's size and the maxima
 // actually observed are recorded back into fmt[] for the caller to verify;
 // a value that does not fit sets *toobig (never possible when the sizes came
-// from vcf_parse_format_max3, which measured this very data).
+// from vcf_parse_format_max3, which measured this very data). col_off, when
+// non-NULL (learned-schema parse only), holds each sample column's ending
+// offset in s, letting skipped column tails be jumped over without scanning.
 static int vcf_parse_format_fill5(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
                                   const char *p, const char *q, fmt_aux_t *fmt,
-                                  int skip_from, int *toobig) {
+                                  int skip_from, const int32_t *col_off,
+                                  int *toobig) {
     static int extreme_val_warned = 0;
     int n_sample_ori = -1;
     // At beginning of the loop t points to the first char of a format
@@ -3187,9 +3190,13 @@ static int vcf_parse_format_fill5(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
                 // parsing by bcf_hdr_set_parse_formats(). Sample columns are
                 // NUL-terminated here (vcf_parse_format_max3), so the scans
                 // stop at the column's end.
-                if (j > skip_from) // j was already incremented above
-                    t += strlen(t); // everything else in the column is skipped
-                else
+                if (j > skip_from) {
+                    // everything else in the column is skipped
+                    if (col_off)
+                        t = s->s + col_off[m]; // column end already known
+                    else
+                        t += strlen(t);
+                } else
                     t += strcspn(t, ":");
             }
             else if (!z->buf) {
@@ -3209,6 +3216,18 @@ static int vcf_parse_format_fill5(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
                     uint32_t max = 0;
                     int overflow = 0;
                     const int gcap = z->size>>2;
+                    if (gcap == 2 && (unsigned)(t[0]-'0') < 10 &&
+                        (t[1]=='|' || t[1]=='/') &&
+                        (unsigned)(t[2]-'0') < 10 &&
+                        (t[3]==':' || t[3]=='\0')) {
+                        // single-digit diploid "a|b" / "a/b", the
+                        // overwhelming case in cohort VCFs
+                        x[0] = (uint32_t)(t[0]-'0'+1) << 1;
+                        x[1] = ((uint32_t)(t[2]-'0'+1) << 1)
+                               | (uint32_t)(t[1]=='|');
+                        t += 3;
+                        l = 2;
+                    } else
                     for (l = 0;; ++t) {
                         if (l >= gcap) { *toobig = 1; return -1; }
                         if (*t == '.') {
@@ -3513,6 +3532,7 @@ static int vcf_parse_format_opt(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
         while (ntabs > 0) s->s[c->tabs[--ntabs]] = '\t';
         return 1;
     }
+    c->tabs[nsamples-1] = (int32_t)s->l; // the final column ends the line
     v->n_sample = nsamples;
 
     for (j = 0; j < v->n_fmt; j++)
@@ -3521,7 +3541,8 @@ static int vcf_parse_format_opt(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
     if (vcf_parse_format_alloc4(s, h, v, p, q, fmt, mem, c->sizes) < 0)
         return -1;
 
-    if (vcf_parse_format_fill5(s, h, v, p, q, fmt, skip_from, &toobig) < 0) {
+    if (vcf_parse_format_fill5(s, h, v, p, q, fmt, skip_from, c->tabs,
+                               &toobig) < 0) {
         if (!toobig) return -1;  // an error the classic parse also raises
         goto fallback;
     }
@@ -3610,7 +3631,7 @@ static int vcf_parse_format(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
 
     // fill the sample fields; at beginning of the loop
     int toobig = 0;
-    if (vcf_parse_format_fill5(s, h, v, p, q, fmt, skip_from, &toobig) < 0)
+    if (vcf_parse_format_fill5(s, h, v, p, q, fmt, skip_from, NULL, &toobig) < 0)
         return -1;
 
     // remember the shapes for the next record (before gt6 compacts fmt[])
@@ -4108,6 +4129,7 @@ typedef struct vcf_mt_batch {
     kstring_t parse_buf;// per-batch copy of the line being parsed
     vcf_szcache szcache;// per-batch learned FORMAT schema (workers race on
                         // the header's copy; batches recycle, so it stays warm)
+    int64_t base_ord;   // file ordinal of this batch's first record
     struct vcf_mt_state *st; // h and max_unpack are immutable while jobs run
 } vcf_mt_batch;
 
@@ -4142,6 +4164,12 @@ typedef struct vcf_mt_state {
     int cur_i;
     vcf_mt_batch **backlog; // drained batches not yet consumed, in order
     int n_backlog, backlog_head, m_backlog;
+    // post-parse callback (bcf_set_parse_callback): run on worker threads
+    // for each successfully parsed record before it is delivered; cb and
+    // cb_data only change while the reader is parked and no jobs run
+    bcf_parse_cb_f cb;
+    void *cb_data;
+    int64_t dispatched;     // records handed to batches so far (reader only)
 } vcf_mt_state;
 
 #define VCF_MT_BATCH_LINES 512
@@ -4161,6 +4189,14 @@ static void vcf_mt_batch_destroy(vcf_mt_batch *b) {
     free(b->parse_buf.s);
     free(b->szcache.tabs);
     free(b);
+}
+
+// run the post-parse callback on one just-parsed record; a negative return
+// from the callback is surfaced as a read error for that record (never -1,
+// which callers treat as end of file)
+static inline int vcf_mt_run_cb(vcf_mt_batch *b, int i) {
+    int ret = b->st->cb(b->st->h, b->recs[i], b->base_ord + i, b->st->cb_data);
+    return ret >= 0 ? b->rets[i] : (ret < -1 ? ret : -2);
 }
 
 // parse one batch; runs on a worker thread with a frozen header
@@ -4184,6 +4220,8 @@ static void *vcf_mt_parse_batch(void *arg) {
             break;
         }
         b->rets[i] = ret;
+        if (ret >= 0 && b->st->cb)
+            b->rets[i] = vcf_mt_run_cb(b, i);
     }
     return b;
 }
@@ -4197,6 +4235,8 @@ static void vcf_mt_parse_serial_tail(vcf_mt_batch *b) {
     for (i = b->serial_from; i < b->n; i++) {
         b->recs[i]->max_unpack = b->st->max_unpack;
         b->rets[i] = vcf_parse(&b->lines[i], b->st->h, b->recs[i]);
+        if (b->rets[i] >= 0 && b->st->cb)
+            b->rets[i] = vcf_mt_run_cb(b, i);
     }
     b->serial_from = -1;
 }
@@ -4316,6 +4356,8 @@ static void *vcf_mt_reader(void *arg) {
             pthread_mutex_unlock(&st->mtx);
             break;
         }
+        b->base_ord = st->dispatched;
+        st->dispatched += b->n; // reader-only field: no lock needed
         // may block waiting for queue space; the consumer popping results
         // frees it, so this cannot deadlock
         if (hts_tpool_dispatch(st->pool, st->q, vcf_mt_parse_batch, b) < 0)
@@ -4449,6 +4491,49 @@ int bcf_set_parse_threads(htsFile *fp, int nthreads)
     pthread_mutex_init(&st->mtx, NULL);
     pthread_cond_init(&st->cv, NULL);
     fp->state = st;
+    return 0;
+}
+
+int bcf_set_parse_callback(htsFile *fp, bcf_parse_cb_f cb, void *data)
+{
+    vcf_mt_state *st;
+    int i, j, was_started;
+    if (!fp || !fp->state)
+        return -1;
+    st = (vcf_mt_state *)fp->state;
+    if (st->magic != VCF_MT_MAGIC)
+        return -1;
+
+    // workers read cb/cb_data, so park the pipeline before changing them
+    was_started = st->reader_started;
+    if (was_started && vcf_mt_reader_stop(st) < 0)
+        return -1;
+    st->cb = cb;
+    st->cb_data = data;
+
+    if (cb) {
+        // apply the callback to records already parsed but not yet
+        // delivered, so every record from here on has been through it;
+        // drained batches may still need their writable-header re-parse
+        if (st->cur) {
+            for (i = st->cur_i; i < st->cur->n; i++)
+                if (st->cur->rets[i] >= 0)
+                    st->cur->rets[i] = vcf_mt_run_cb(st->cur, i);
+        }
+        for (j = st->backlog_head; j < st->n_backlog; j++) {
+            vcf_mt_batch *b = st->backlog[j];
+            // the serial tail runs the (new) callback itself for the
+            // records it re-parses; cover only the ones before it
+            int upto = b->serial_from >= 0 ? b->serial_from : b->n;
+            vcf_mt_parse_serial_tail(b);
+            for (i = 0; i < upto; i++)
+                if (b->rets[i] >= 0)
+                    b->rets[i] = vcf_mt_run_cb(b, i);
+        }
+    }
+
+    if (was_started && vcf_mt_reader_start(st) < 0)
+        return -1;
     return 0;
 }
 
