@@ -108,6 +108,25 @@ static bcf_idinfo_t bcf_idinfo_def = { .info = { 15, 15, 15 }, .hrec = { NULL, N
 
 #define BCF_IS_64BIT (1<<30)
 
+#define MAX_N_FMT 255   /* Limited by size of bcf1_t n_fmt field */
+
+// Learned FORMAT schema: the per-field pivot sizes observed on a previously
+// parsed record. When consecutive records share the FORMAT layout (the common
+// case for cohort VCFs) the sizing pass over all sample columns is skipped and
+// values are written directly with overflow checks; any shape surprise falls
+// back to the classic two-pass parse for that record, so the encoded result
+// is always bit-identical to the classic parse.
+typedef struct {
+    int valid;              // cache holds a usable schema
+    int penalty;            // parse this many records classically after a miss
+    int n_fmt;              // number of FORMAT fields in the cached schema
+    int keys[MAX_N_FMT];    // header dictionary ids
+    int sizes[MAX_N_FMT];   // per-field pivot size (fmt_aux_t.size)
+    uint8_t skip[MAX_N_FMT];// field excluded by bcf_hdr_set_parse_formats()
+    int32_t *tabs;          // scratch: offsets of sample-column separators
+    int m_tabs;             // allocated slots in tabs
+} vcf_szcache;
+
 
 // Opaque structure with auxilary data which allows to extend bcf_hdr_t without breaking ABI.
 // Note that this preserving API and ABI requires that the first element is vdict_t struct
@@ -119,6 +138,7 @@ typedef struct
     hdict_t *gen;   // hdict_t dictionary which keeps bcf_hrec_t* pointers for generic and structured fields
     size_t *key_len;// length of h->id[BCF_DT_ID] strings
     char *parse_formats; // bcf_hdr_set_parse_formats(): comma-separated FORMAT fields to parse, NULL = all
+    vcf_szcache szcache; // learned FORMAT schema for serial vcf_parse calls
 }
 bcf_hdr_aux_t;
 
@@ -1459,6 +1479,7 @@ void bcf_hdr_destroy(bcf_hdr_t *h)
             kh_destroy(hdict, aux->gen);
             free(aux->key_len); // may exist for dict[0] only
             free(aux->parse_formats);
+            free(aux->szcache.tabs);
         }
         kh_destroy(vdict, d);
         free(h->id[i]);
@@ -2795,7 +2816,24 @@ typedef struct {
 typedef struct {
     kstring_t *scratch;
     int hdr_frozen;
+    vcf_szcache *cache; // learned FORMAT schema, NULL = disabled
 } vcf_parse_ctx;
+
+// kill-switch for the learned-schema FORMAT parse: HTS_VCF_SCHEMA_CACHE=0
+static int vcf_szcache_on;
+static pthread_once_t vcf_szcache_once = PTHREAD_ONCE_INIT;
+
+static void vcf_szcache_init(void)
+{
+    const char *e = getenv("HTS_VCF_SCHEMA_CACHE");
+    vcf_szcache_on = !(e && *e=='0');
+}
+
+static int vcf_szcache_enabled(void)
+{
+    pthread_once(&vcf_szcache_once, vcf_szcache_init);
+    return vcf_szcache_on;
+}
 
 // Internal return code: parsing this line requires a header modification
 // (undeclared tag or contig) which ctx->hdr_frozen forbids. The caller must
@@ -2845,8 +2883,6 @@ static inline int align_mem(kstring_t *s)
     }
     return e == 0 ? 0 : -1;
 }
-
-#define MAX_N_FMT 255   /* Limited by size of bcf1_t n_fmt field */
 
 // detect FORMAT "."
 static int vcf_parse_format_empty1(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
@@ -3028,10 +3064,25 @@ static int vcf_parse_format_max3(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
     return 0;
 }
 
-// allocate memory for arrays
+// pivot size of one FORMAT field from the maxima observed across the samples
+// (an omitted trailing numeric field still stores one missing value, hence
+// the max_m clamp); -2 = unsupported field type
+static inline int vcf_fmt_size(const fmt_aux_t *f)
+{
+    const int htype = f->y>>4&0xf;
+    if (htype == BCF_HT_STR)
+        return f->is_gt ? (int)f->max_g << 2 : (int)f->max_l;
+    if (htype == BCF_HT_REAL || htype == BCF_HT_INT)
+        return (f->max_m ? (int)f->max_m : 1) << 2;
+    return -2;
+}
+
+// allocate memory for arrays; fixed_sizes = per-field sizes from the learned
+// schema instead of the observed maxima, NULL for the classic parse
 static int vcf_parse_format_alloc4(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
                                    const char *p, const char *q,
-                                   fmt_aux_t *fmt, kstring_t *mem) {
+                                   fmt_aux_t *fmt, kstring_t *mem,
+                                   const int *fixed_sizes) {
     int j;
     for (j = 0; j < v->n_fmt; ++j) {
         fmt_aux_t *f = &fmt[j];
@@ -3042,13 +3093,9 @@ static int vcf_parse_format_alloc4(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
             f->offset = 0;
             continue;
         }
-        if ( !f->max_m ) f->max_m = 1;  // omitted trailing format field
 
-        if ((f->y>>4&0xf) == BCF_HT_STR) {
-            f->size = f->is_gt? f->max_g << 2 : f->max_l;
-        } else if ((f->y>>4&0xf) == BCF_HT_REAL || (f->y>>4&0xf) == BCF_HT_INT) {
-            f->size = f->max_m << 2;
-        } else {
+        f->size = fixed_sizes ? fixed_sizes[j] : vcf_fmt_size(f);
+        if (f->size == -2) {
             hts_log_error("The format type %d at %s:%"PRIhts_pos" is currently not supported", f->y>>4&0xf, bcf_seqname_safe(h,v), v->pos+1);
             v->errcode |= BCF_ERR_TAG_INVALID;
             return -1;
@@ -3091,10 +3138,14 @@ static int vcf_parse_format_alloc4(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
     return 0;
 }
 
-// Fill the sample fields
+// Fill the sample fields. Under the learned-schema parse the field sizes are
+// only a guess, so every write is capped by the field's size and the maxima
+// actually observed are recorded back into fmt[] for the caller to verify;
+// a value that does not fit sets *toobig (never possible when the sizes came
+// from vcf_parse_format_max3, which measured this very data).
 static int vcf_parse_format_fill5(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
                                   const char *p, const char *q, fmt_aux_t *fmt,
-                                  int skip_from) {
+                                  int skip_from, int *toobig) {
     static int extreme_val_warned = 0;
     int n_sample_ori = -1;
     // At beginning of the loop t points to the first char of a format
@@ -3121,6 +3172,13 @@ static int vcf_parse_format_fill5(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
         int j = 0; // j-th format field, m-th sample
         while ( t < end )
         {
+            if (j == v->n_fmt) {
+                // more fields than FORMAT declares; vcf_parse_format_max3
+                // reports this, so it can only happen on the learned-schema
+                // parse, which skips that pass
+                *toobig = 1;
+                return -1;
+            }
             fmt_aux_t *z = &fmt[j++];
             const int htype = z->y>>4&0xf;
             if ( z->size==-1 )
@@ -3150,7 +3208,9 @@ static int vcf_parse_format_fill5(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
                     uint32_t unreadable = 0;
                     uint32_t max = 0;
                     int overflow = 0;
+                    const int gcap = z->size>>2;
                     for (l = 0;; ++t) {
+                        if (l >= gcap) { *toobig = 1; return -1; }
                         if (*t == '.') {
                             ++t, x[l++] = is_phased;
                         } else {
@@ -3183,14 +3243,18 @@ static int vcf_parse_format_fill5(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
                         return -1;
                     }
                     if ( !l ) x[l++] = 0;   // An empty field, insert missing value
+                    if (z->max_g < (uint32_t)l) z->max_g = l;
                     for (; l < z->size>>2; ++l)
                         x[l] = bcf_int32_vector_end;
 
                 } else {
                     // Otherwise arbitrary strings
                     char *x = (char*)z->buf + z->size * (size_t)m;
-                    for (l = 0; *t != ':' && *t; ++t)
+                    for (l = 0; *t != ':' && *t; ++t) {
+                        if (l >= z->size) { *toobig = 1; return -1; }
                         x[l++] = *t;
+                    }
+                    if (z->max_l < (uint32_t)l) z->max_l = l;
                     if (z->size > l)
                         memset(&x[l], 0, (z->size-l) * sizeof(*x));
                 }
@@ -3198,8 +3262,10 @@ static int vcf_parse_format_fill5(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
             } else if (htype == BCF_HT_INT) {
                 // One or more integers in an array
                 int32_t *x = (int32_t*)(z->buf + z->size * (size_t)m);
+                const int mcap = z->size>>2;
                 int l;
                 for (l = 0;; ++t) {
+                    if (l >= mcap) { *toobig = 1; return -1; }
                     if (*t == '.') {
                         x[l++] = bcf_int32_missing, ++t; // ++t to skip "."
                     } else {
@@ -3223,14 +3289,17 @@ static int vcf_parse_format_fill5(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
                 }
                 if ( !l )
                     x[l++] = bcf_int32_missing;
+                if (z->max_m < (uint32_t)l) z->max_m = l;
                 for (; l < z->size>>2; ++l)
                     x[l] = bcf_int32_vector_end;
 
             } else if (htype == BCF_HT_REAL) {
                 // One of more floating point values in an array
                 float *x = (float*)(z->buf + z->size * (size_t)m);
+                const int mcap = z->size>>2;
                 int l;
                 for (l = 0;; ++t) {
+                    if (l >= mcap) { *toobig = 1; return -1; }
                     if (*t == '.' && !isdigit_c(t[1])) {
                         bcf_float_set_missing(x[l++]), ++t; // ++t to skip "."
                     } else {
@@ -3250,6 +3319,7 @@ static int vcf_parse_format_fill5(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
                 if ( !l )
                     // An empty field, insert missing value
                     bcf_float_set_missing(x[l++]);
+                if (z->max_m < (uint32_t)l) z->max_m = l;
                 for (; l < z->size>>2; ++l)
                     bcf_float_set_vector_end(x[l]);
             } else {
@@ -3376,6 +3446,110 @@ static int vcf_parse_format_check7(const bcf_hdr_t *h, bcf1_t *v) {
     return 0;
 }
 
+// can the learned schema drive this record's FORMAT parse?
+static int vcf_szcache_usable(vcf_szcache *c, const bcf_hdr_t *h,
+                              const bcf1_t *v, const fmt_aux_t *fmt)
+{
+    int j;
+    if (!c->valid || h->keep_samples) return 0;
+    if (c->penalty > 0) { c->penalty--; return 0; }
+    if (c->n_fmt != v->n_fmt) return 0;
+    for (j = 0; j < v->n_fmt; j++)
+        if (c->keys[j] != fmt[j].key || c->skip[j] != (fmt[j].skip ? 1 : 0))
+            return 0;
+    return 1;
+}
+
+// remember the shapes of a classically parsed record for the next one
+static void vcf_szcache_store(vcf_szcache *c, const bcf1_t *v,
+                              const fmt_aux_t *fmt)
+{
+    int j;
+    c->valid = 0;
+    for (j = 0; j < v->n_fmt; j++) {
+        if (!fmt[j].skip && fmt[j].size < 0) return; // over the ~2Gb row limit
+        c->keys[j] = fmt[j].key;
+        c->sizes[j] = fmt[j].size;
+        c->skip[j] = fmt[j].skip ? 1 : 0;
+    }
+    c->n_fmt = v->n_fmt;
+    c->valid = 1;
+}
+
+// Parse the sample columns optimistically with sizes learned from a previous
+// record: the sizing pass (vcf_parse_format_max3) is replaced by one tab scan,
+// values are written with overflow checks, and the result is kept only when
+// the shapes observed while filling match the schema exactly, so the encoded
+// record is bit-identical to the classic parse. fmt[] must be freshly set up
+// by vcf_parse_format_dict2 (zeroed maxima). Returns 0 done, -1 error, 1 =
+// the caller must run the classic parse (fmt[] and the line are restored).
+static int vcf_parse_format_opt(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
+                                const char *p, const char *q, fmt_aux_t *fmt,
+                                kstring_t *mem, vcf_szcache *c, int skip_from)
+{
+    char *r = (char *)q + 1;
+    char *end = s->s + s->l;
+    const int nsamples = bcf_hdr_nsamples(h);
+    int ntabs = 0, j, toobig = 0;
+    const int saved_errcode = v->errcode;
+
+    // NUL-terminate the sample columns (the classic sizing pass does this as
+    // a side effect); remember the offsets so a fallback can restore them
+    if (c->m_tabs < nsamples) {
+        int32_t *tabs = (int32_t *)realloc(c->tabs, nsamples * sizeof(*tabs));
+        if (!tabs) return 1;
+        c->tabs = tabs;
+        c->m_tabs = nsamples;
+    }
+    while (ntabs < nsamples - 1) {
+        char *tab = memchr(r, '\t', end - r);
+        if (!tab) break;
+        c->tabs[ntabs++] = (int32_t)(tab - s->s);
+        *tab = 0;
+        r = tab + 1;
+    }
+    if (ntabs != nsamples - 1 || memchr(r, '\t', end - r)) {
+        // wrong number of sample columns: let the classic parse handle it
+        while (ntabs > 0) s->s[c->tabs[--ntabs]] = '\t';
+        return 1;
+    }
+    v->n_sample = nsamples;
+
+    for (j = 0; j < v->n_fmt; j++)
+        fmt[j].offset = 0;
+
+    if (vcf_parse_format_alloc4(s, h, v, p, q, fmt, mem, c->sizes) < 0)
+        return -1;
+
+    if (vcf_parse_format_fill5(s, h, v, p, q, fmt, skip_from, &toobig) < 0) {
+        if (!toobig) return -1;  // an error the classic parse also raises
+        goto fallback;
+    }
+
+    // keep the result only when the observed shapes reproduce the schema:
+    // a shrunk field must be re-encoded with its smaller size to match the
+    // classic parse, so it falls back too, as does a field the allocator
+    // dropped for exceeding the row limit (classic may size it smaller)
+    for (j = 0; j < v->n_fmt; j++) {
+        if (fmt[j].skip) continue;
+        if (fmt[j].size == -1 || vcf_fmt_size(&fmt[j]) != c->sizes[j])
+            goto fallback;
+    }
+
+    if (vcf_parse_format_gt6(s, h, v, p, q, fmt) < 0)
+        return -1;
+    return vcf_parse_format_check7(h, v) < 0 ? -1 : 0;
+
+ fallback:
+    for (j = 0; j < nsamples - 1; j++) s->s[c->tabs[j]] = '\t';
+    for (j = 0; j < v->n_fmt; j++)
+        fmt[j].max_l = fmt[j].max_m = fmt[j].max_g = 0;
+    mem->l = 0;
+    v->errcode = saved_errcode;
+    c->penalty = 8;
+    return 1;
+}
+
 // p,q is the start and the end of the FORMAT field
 static int vcf_parse_format(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
                             char *p, char *q, vcf_parse_ctx *ctx)
@@ -3418,17 +3592,30 @@ static int vcf_parse_format(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
     int skip_from = v->n_fmt;
     while (skip_from > 0 && fmt[skip_from-1].skip) skip_from--;
 
+    // parse optimistically with the schema learned from a previous record,
+    // skipping the sizing pass; >0 = shape surprise, parse classically below
+    if (ctx->cache && vcf_szcache_usable(ctx->cache, h, v, fmt)) {
+        ret = vcf_parse_format_opt(s, h, v, p, q, fmt, mem, ctx->cache,
+                                   skip_from);
+        if (ret <= 0) return ret;
+    }
+
     // compute max
     if (vcf_parse_format_max3(s, h, v, p, q, fmt, skip_from) < 0)
         return -1;
 
     // allocate memory for arrays
-    if (vcf_parse_format_alloc4(s, h, v, p, q, fmt, mem) < 0)
+    if (vcf_parse_format_alloc4(s, h, v, p, q, fmt, mem, NULL) < 0)
         return -1;
 
     // fill the sample fields; at beginning of the loop
-    if (vcf_parse_format_fill5(s, h, v, p, q, fmt, skip_from) < 0)
+    int toobig = 0;
+    if (vcf_parse_format_fill5(s, h, v, p, q, fmt, skip_from, &toobig) < 0)
         return -1;
+
+    // remember the shapes for the next record (before gt6 compacts fmt[])
+    if (ctx->cache)
+        vcf_szcache_store(ctx->cache, v, fmt);
 
     // write individual genotype information
     if (vcf_parse_format_gt6(s, h, v, p, q, fmt) < 0)
@@ -3871,7 +4058,11 @@ static int vcf_parse_ctx1(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
 
 int vcf_parse(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v)
 {
-    vcf_parse_ctx ctx = { (kstring_t *)&h->mem, 0 };
+    // the schema cache lives in the header, which vcf_parse already mutates
+    // (h->mem, dummy header lines), so this adds no new thread constraint
+    vcf_parse_ctx ctx = { (kstring_t *)&h->mem, 0,
+                          vcf_szcache_enabled() ? &get_hdr_aux(h)->szcache
+                                                : NULL };
     return vcf_parse_ctx1(s, h, v, &ctx);
 }
 
@@ -3915,6 +4106,8 @@ typedef struct vcf_mt_batch {
     int serial_from;    // first line needing a writable-header re-parse, or -1
     kstring_t scratch;  // per-batch FORMAT pivot buffer (instead of h->mem)
     kstring_t parse_buf;// per-batch copy of the line being parsed
+    vcf_szcache szcache;// per-batch learned FORMAT schema (workers race on
+                        // the header's copy; batches recycle, so it stays warm)
     struct vcf_mt_state *st; // h and max_unpack are immutable while jobs run
 } vcf_mt_batch;
 
@@ -3966,13 +4159,15 @@ static void vcf_mt_batch_destroy(vcf_mt_batch *b) {
     free(b->rets);
     free(b->scratch.s);
     free(b->parse_buf.s);
+    free(b->szcache.tabs);
     free(b);
 }
 
 // parse one batch; runs on a worker thread with a frozen header
 static void *vcf_mt_parse_batch(void *arg) {
     vcf_mt_batch *b = (vcf_mt_batch *)arg;
-    vcf_parse_ctx ctx = { &b->scratch, 1 };
+    vcf_parse_ctx ctx = { &b->scratch, 1,
+                          vcf_szcache_enabled() ? &b->szcache : NULL };
     int i;
     b->serial_from = -1;
     for (i = 0; i < b->n; i++) {

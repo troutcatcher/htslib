@@ -711,6 +711,99 @@ void test_parse_threads(void)
     remove(fname);
 }
 
+#define SZC_RECS 42
+
+// The learned-schema FORMAT parse must be transparent: records whose shapes
+// repeat are parsed against the cached schema, and every shape change (grown
+// values, shrunk values, more GT alleles, a different FORMAT layout, omitted
+// trailing fields) must fall back to produce exactly the classic result.
+void test_schema_cache(void)
+{
+    const char *fname = "rmme_szcache.vcf";
+    static char lines[SZC_RECS][160];
+    const char *expected[SZC_RECS];
+    int i;
+
+    for (i = 0; i < SZC_RECS; i++) {
+        char body[120];
+        if (i < 10)         // stable shape: learned once, then hit
+            snprintf(body, sizeof(body), "GT:AD:GP:FT\t"
+                     "0|1:%d,2:0.5,0.5:PASS\t1/1:%d:0.25:q10", i, i);
+        else if (i < 20)    // AD grows: write overflow -> fallback
+            snprintf(body, sizeof(body), "GT:AD:GP:FT\t"
+                     "0|1:1,2,%d:0.5,0.5:PASS\t1/1:4:0.25:LONGFILT", i);
+        else if (i < 30)    // AD and FT shrink: shape mismatch -> fallback
+            snprintf(body, sizeof(body), "GT:AD:GP:FT\t"
+                     "0|1:%d:0.5,0.5:P\t1/1:%d:0.25:q", i, i);
+        else if (i == 30)   // triploid GT: write overflow -> fallback
+            snprintf(body, sizeof(body), "GT:AD:GP:FT\t"
+                     "0/1/1:5:0.5,0.5:P\t1/1:6:0.25:q");
+        else if (i < 41)    // different FORMAT layout: schema mismatch
+            snprintf(body, sizeof(body), "GT:AD\t0|1:7,8\t1/1:%d", i);
+        else                // trailing field omitted in the last sample
+            snprintf(body, sizeof(body), "GT:AD\t0|1:7,8\t1/1");
+        snprintf(lines[i], sizeof(lines[i]), "1\t%d\t.\tA\tT\t.\t.\t.\t%s\n",
+                 i + 1, body);
+        expected[i] = lines[i];
+    }
+    // a missing trailing field is written back as "."
+    expected[41] = "1\t42\t.\tA\tT\t.\t.\t.\tGT:AD\t0|1:7,8\t1/1:.\n";
+
+    FILE *f = fopen(fname, "w");
+    if (!f) error("test_schema_cache: failed to create %s", fname);
+    fputs("##fileformat=VCFv4.2\n"
+          "##contig=<ID=1,length=100000>\n"
+          "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n"
+          "##FORMAT=<ID=AD,Number=.,Type=Integer,Description=\"Depths\">\n"
+          "##FORMAT=<ID=GP,Number=.,Type=Float,Description=\"Probs\">\n"
+          "##FORMAT=<ID=FT,Number=1,Type=String,Description=\"Filter\">\n"
+          "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\n",
+          f);
+    for (i = 0; i < SZC_RECS; i++) fputs(lines[i], f);
+    if (fclose(f)) error("test_schema_cache: failed to write %s", fname);
+
+    htsFile *fp = hts_open(fname, "r");
+    bcf_hdr_t *hdr = bcf_hdr_read(fp);
+    bcf1_t *line = bcf_init();
+    kstring_t str = {0,0,0};
+    int32_t *ad = NULL;
+    int nad = 0;
+    if (!fp || !hdr || !line) error("test_schema_cache: failed to open %s", fname);
+    for (i = 0; i < SZC_RECS; i++) {
+        if (bcf_read(fp, hdr, line) < 0)
+            error("test_schema_cache: failed to read record %d", i + 1);
+        str.l = 0;
+        if (vcf_format(hdr, line, &str) != 0)
+            error("test_schema_cache: vcf_format failed on record %d", i + 1);
+        if (strcmp(str.s, expected[i]) != 0)
+            error("test_schema_cache: record %d round-trip mismatch:\n"
+                  "  expected: %s  got:      %s", i + 1, expected[i], str.s);
+        // spot-check the encoded widths, which round-tripping cannot see
+        if (i == 0 || i == 41) { // [7,8] and [missing] on record 42
+            int32_t a2 = i == 0 ? 2 : 8, a3 = i == 0 ? 0 : bcf_int32_missing;
+            if (bcf_get_format_int32(hdr, line, "AD", &ad, &nad) != 4 ||
+                ad[1] != a2 || ad[2] != a3 || ad[3] != bcf_int32_vector_end)
+                error("test_schema_cache: record %d has wrong AD encoding", i + 1);
+        }
+        if (i == 20 && (bcf_get_format_int32(hdr, line, "AD", &ad, &nad) != 2 ||
+                        ad[0] != 20 || ad[1] != 20))
+            error("test_schema_cache: shrunk AD has wrong encoding");
+        if (i == 30) { // triploid sample widens GT to 3 for both samples
+            if (bcf_get_genotypes(hdr, line, &ad, &nad) != 6 ||
+                ad[2] != bcf_gt_unphased(1) || ad[5] != bcf_int32_vector_end)
+                error("test_schema_cache: triploid GT has wrong encoding");
+        }
+    }
+    if (bcf_read(fp, hdr, line) != -1)
+        error("test_schema_cache: expected EOF after %d records", SZC_RECS);
+    free(ad);
+    free(str.s);
+    bcf_destroy(line);
+    bcf_hdr_destroy(hdr);
+    if (hts_close(fp)) error("test_schema_cache: hts_close failed");
+    remove(fname);
+}
+
 void test_invalid_end_tag(void)
 {
     static const char vcf_data[] = "data:,"
@@ -825,5 +918,6 @@ int main(int argc, char **argv)
     test_open_format();
     test_parse_formats();
     test_parse_threads();
+    test_schema_cache();
     return 0;
 }
