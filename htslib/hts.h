@@ -1096,6 +1096,28 @@ int hts_idx_set_meta(hts_idx_t *idx, uint32_t l_meta, uint8_t *meta, int is_copy
 HTSLIB_EXPORT
 int hts_idx_get_stat(const hts_idx_t* idx, int tid, uint64_t* mapped, uint64_t* unmapped);
 
+/// Suggest virtual-offset split points for parallel range reading
+/** @param      idx      Index (must carry a linear index: TBI or BAI)
+    @param      nranges  Desired number of ranges (>= 1)
+    @param[out] starts   *starts is set to a malloc()ed, ascending array of
+                         up to @p nranges - 1 interior split points; the
+                         caller must free() it
+    @param[out] nout     Number of split points stored in *starts
+    @return 0 on success (possibly with *nout == 0 when the index is too
+            small to split), -1 on error or for index formats without a
+            linear index (CSI, CRAI)
+
+Each returned value is a BGZF virtual offset at which a record starts, drawn
+from the index's linear index and chosen so the ranges between consecutive
+split points cover roughly equal amounts of the compressed file. A caller
+can read the whole file in parallel by giving each thread its own file
+handle: thread 0 reads from the beginning, thread k seeks to split k-1 with
+bgzf_seek(), and every thread stops when bgzf_tell() reaches the next split
+point (the last thread reads to end of file).
+*/
+HTSLIB_EXPORT
+int hts_idx_split(const hts_idx_t *idx, int nranges, uint64_t **starts, int *nout);
+
 /// Return the number of unplaced reads from an index
 /** @param idx    Index
     @return Unplaced reads count

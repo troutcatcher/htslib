@@ -2940,6 +2940,64 @@ int hts_idx_nseq(const hts_idx_t *idx) {
     return idx->n;
 }
 
+int hts_idx_split(const hts_idx_t *idx, int nranges, uint64_t **starts, int *nout)
+{
+    uint64_t *all = NULL, *out, last = 0, c0, c1;
+    int i, n = 0, m = 0, splits, k, w = 0;
+    hts_pos_t j;
+    *starts = NULL;
+    *nout = 0;
+    if (!idx || nranges < 1 || !idx->lidx)
+        return -1;
+    if (idx->fmt != HTS_FMT_TBI && idx->fmt != HTS_FMT_BAI)
+        return -1; // CSI keeps no linear index
+
+    // gather the distinct record-start virtual offsets the linear index
+    // knows about, in file order (tids are stored in file order)
+    for (i = 0; i < idx->n; i++) {
+        const lidx_t *l = &idx->lidx[i];
+        for (j = 0; j < l->n; j++) {
+            uint64_t off = l->offset[j];
+            if (off == 0 || off <= last) continue; // gap-fill and repeats
+            if (n == m) {
+                uint64_t *tmp;
+                m = m ? m * 2 : 1024;
+                if (!(tmp = realloc(all, m * sizeof(*all)))) {
+                    free(all);
+                    return -1;
+                }
+                all = tmp;
+            }
+            all[n++] = off;
+            last = off;
+        }
+    }
+    if (n == 0) { free(all); return 0; }
+
+    // pick split points evenly spaced by compressed offset, so the ranges
+    // carry roughly equal amounts of file
+    splits = nranges - 1 < n ? nranges - 1 : n;
+    if (splits == 0) { free(all); return 0; }
+    if (!(out = malloc(splits * sizeof(*out)))) { free(all); return -1; }
+    c0 = all[0] >> 16;
+    c1 = all[n-1] >> 16;
+    for (k = 1; k <= splits; k++) {
+        uint64_t target = c0 + (c1 - c0) / (splits + 1) * k;
+        int lo = 0, hi = n - 1;
+        while (lo < hi) { // first candidate at or past the target
+            int mid = lo + (hi - lo) / 2;
+            if ((all[mid] >> 16) < target) lo = mid + 1;
+            else hi = mid;
+        }
+        if (w == 0 || all[lo] != out[w-1])
+            out[w++] = all[lo];
+    }
+    free(all);
+    *starts = out;
+    *nout = w;
+    return 0;
+}
+
 int hts_idx_get_stat(const hts_idx_t* idx, int tid, uint64_t* mapped, uint64_t* unmapped)
 {
     if (!idx) return -1;
