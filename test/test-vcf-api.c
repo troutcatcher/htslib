@@ -711,6 +711,76 @@ void test_parse_threads(void)
     remove(fname);
 }
 
+typedef struct {
+    int64_t *seen;      // per-ordinal POS recorded by the callback
+    int n;
+    int64_t err;        // out-of-range ordinals observed
+} parse_cb_data;
+
+static int test_parse_cb(const bcf_hdr_t *h, bcf1_t *v, int64_t ord, void *data)
+{
+    parse_cb_data *d = (parse_cb_data *)data;
+    if (ord < 0 || ord >= d->n) { d->err++; return 0; }
+    d->seen[ord] = v->pos; // each ordinal is processed exactly once
+    return 0;
+}
+
+#define CB_TEST_RECS 3000
+
+// the post-parse callback must see every not-yet-delivered record exactly
+// once, on the workers or (for writable-header re-parses and records parsed
+// ahead when the callback is installed mid-stream) on the reading thread,
+// with ordinals matching delivery order
+void test_parse_callback(void)
+{
+    const char *fname = "rmme_parse_cb.vcf";
+    static int64_t seen[CB_TEST_RECS];
+    parse_cb_data d = { seen, CB_TEST_RECS, 0 };
+    int i, n = 0;
+    FILE *f = fopen(fname, "w");
+    if (!f) error("test_parse_callback: failed to create %s", fname);
+    fputs("##fileformat=VCFv4.2\n"
+          "##contig=<ID=1,length=100000>\n" // contig 2 deliberately undeclared
+          "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n"
+          "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\n", f);
+    for (i = 0; i < CB_TEST_RECS; i++)
+        fprintf(f, "%d\t%d\t.\tA\tT\t.\t.\t.\tGT\t0|1\t1/1\n",
+                i < CB_TEST_RECS/2 ? 1 : 2, i + 1);
+    if (fclose(f)) error("test_parse_callback: failed to write %s", fname);
+
+    for (i = 0; i < CB_TEST_RECS; i++) seen[i] = -1;
+
+    htsFile *fp = hts_open(fname, "r");
+    bcf_hdr_t *hdr = fp ? bcf_hdr_read(fp) : NULL;
+    bcf1_t *line = bcf_init();
+    if (!fp || !hdr || !line) error("test_parse_callback: failed to open %s", fname);
+    if (bcf_set_parse_callback(fp, test_parse_cb, &d) != -1)
+        error("test_parse_callback: expected failure without parse threads");
+    check0(bcf_set_parse_threads(fp, 2));
+
+    // deliver a few records before installing the callback: it must cover
+    // everything not yet delivered, and only that
+    while (n < 5 && bcf_read(fp, hdr, line) >= 0) n++;
+    check0(bcf_set_parse_callback(fp, test_parse_cb, &d));
+    while (n < CB_TEST_RECS && bcf_read(fp, hdr, line) >= 0) {
+        if (seen[n] != line->pos)
+            error("test_parse_callback: record %d has seen=%"PRId64" pos=%"PRId64,
+                  n, seen[n], (int64_t)line->pos);
+        n++;
+    }
+    if (n != CB_TEST_RECS || d.err)
+        error("test_parse_callback: read %d records, %"PRId64" bad ordinals",
+              n, d.err);
+    for (i = 0; i < 5; i++)
+        if (seen[i] != -1)
+            error("test_parse_callback: callback ran for delivered record %d", i);
+
+    bcf_destroy(line);
+    bcf_hdr_destroy(hdr);
+    if (hts_close(fp)) error("test_parse_callback: hts_close failed");
+    remove(fname);
+}
+
 #define SZC_RECS 42
 
 // The learned-schema FORMAT parse must be transparent: records whose shapes
@@ -918,6 +988,7 @@ int main(int argc, char **argv)
     test_open_format();
     test_parse_formats();
     test_parse_threads();
+    test_parse_callback();
     test_schema_cache();
     return 0;
 }

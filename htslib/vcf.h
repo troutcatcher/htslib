@@ -390,6 +390,45 @@ typedef struct bcf1_t {
     HTSLIB_EXPORT
     int bcf_set_parse_threads(htsFile *fp, int nthreads);
 
+    /// Callback for bcf_set_parse_callback(), run once per parsed record
+    /** @param h        the reader's header (must be treated as read-only)
+     *  @param v        the freshly parsed record (not yet unpacked)
+     *  @param ordinal  0-based index of the record, counted from the point
+     *                  bcf_set_parse_threads() was enabled
+     *  @param data     the pointer registered with the callback
+     *  @return 0 to deliver the record normally; a negative value marks the
+     *          record as a read error surfaced by bcf_read()
+     */
+    typedef int (*bcf_parse_cb_f)(const bcf_hdr_t *h, bcf1_t *v,
+                                  int64_t ordinal, void *data);
+
+    /**
+     *  bcf_set_parse_callback() - run per-record work on the parse workers
+     *  @param fp    VCF file with bcf_set_parse_threads() already enabled
+     *  @param cb    callback to run after each record parses, or NULL to
+     *               remove the current callback
+     *  @param data  opaque pointer passed through to @p cb
+     *
+     *  The callback runs on the parser's worker threads, immediately after
+     *  each record is parsed and before it is delivered by bcf_read(), so
+     *  per-record computation (unpacking, extracting or transforming fields)
+     *  overlaps with parsing and with the caller's own work instead of
+     *  serializing on the reading thread. It may be invoked concurrently
+     *  from several threads and must be thread-safe; it may modify the
+     *  record (e.g. call bcf_unpack()) but must not touch the header.
+     *  Records whose parse required a writable header are re-parsed on the
+     *  reading thread, and the callback runs there for them.
+     *
+     *  When enabled mid-stream, records already parsed ahead but not yet
+     *  delivered are passed to the callback (with their correct ordinals)
+     *  before it returns, so every record from the next bcf_read() on has
+     *  been through it exactly once.
+     *
+     *  Returns 0 on success, or -1 if @p fp has no threaded VCF parser.
+     */
+    HTSLIB_EXPORT
+    int bcf_set_parse_callback(htsFile *fp, bcf_parse_cb_f cb, void *data);
+
     /**
      *  bcf_hdr_set_parse_formats() - restrict VCF text parsing to given FORMAT fields
      *  @param fmts  comma-separated list of FORMAT field names to parse
