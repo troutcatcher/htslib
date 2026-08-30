@@ -3835,11 +3835,19 @@ static int vcf_parse_filter(kstring_t *str, const bcf_hdr_t *h, bcf1_t *v, char 
 
 static int vcf_parse_info(kstring_t *str, const bcf_hdr_t *h, bcf1_t *v, char *p, char *q) {
     static int extreme_int_warned = 0, negative_rlen_warned = 0;
-    int max_n_val = 0, overflow = 0;
+    int overflow = 0;
     char *r, *key;
     khint_t k;
     vdict_t *d = (vdict_t*)h->dict[BCF_DT_ID];
-    int32_t *a_val = NULL;
+
+    // Almost all INFO values are scalars or short per-allele arrays, so
+    // use a stack buffer for the common case instead of a heap allocation
+    // that would otherwise be made (and freed) for practically every
+    // record parsed.  Rare fields with more values than this fall back to
+    // hts_realloc_p() below, exactly as before.
+    int32_t a_val_sbo[64];
+    int32_t *a_val = a_val_sbo;
+    int max_n_val = sizeof(a_val_sbo) / sizeof(a_val_sbo[0]);
 
     v->n_info = 0;
     if (*(q-1) == ';') *(q-1) = 0;
@@ -3899,7 +3907,8 @@ static int vcf_parse_info(kstring_t *str, const bcf_hdr_t *h, bcf1_t *v, char *p
                 if (*t == ',') ++n_val;
             // Check both int and float size in one step for simplicity
             if (n_val > max_n_val) {
-                int32_t *a_tmp = hts_realloc_p(a_val, sizeof(*a_val), n_val);
+                int32_t *a_tmp = hts_realloc_p(a_val != a_val_sbo ? a_val : NULL,
+                                                sizeof(*a_val), n_val);
                 if (!a_tmp) {
                     hts_log_error("Could not allocate memory at %s:%"PRIhts_pos, bcf_seqname_safe(h,v), v->pos+1);
                     v->errcode |= BCF_ERR_LIMITS; // No appropriate code?
@@ -3997,11 +4006,11 @@ static int vcf_parse_info(kstring_t *str, const bcf_hdr_t *h, bcf1_t *v, char *p
         key = r + 1;
     }
 
-    free(a_val);
+    if (a_val != a_val_sbo) free(a_val);
     return 0;
 
  fail:
-    free(a_val);
+    if (a_val != a_val_sbo) free(a_val);
     return -1;
 }
 
