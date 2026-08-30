@@ -357,6 +357,9 @@ config.h:
 	echo '// Enable extra OpenBSD checks (see simd.c)' >> $@
 	echo '#define HAVE_OPENBSD' >> $@
 	echo '#endif' >> $@
+	echo '#if defined __linux__ || defined __FreeBSD__ || defined __OpenBSD__ || defined __NetBSD__' >> $@
+	echo '#define HAVE_STRCHRNUL 1' >> $@
+	echo '#endif' >> $@
 
 # And similarly for htslib.pc.tmp ("pkg-config template").  No dependency
 # on htslib.pc.in listed, as if that file is newer the usual way to regenerate

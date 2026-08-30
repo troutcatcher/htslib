@@ -24,6 +24,14 @@
    SOFTWARE.
 */
 
+// Request strchrnul(), a glibc/BSD libc extension used by kstrtok() below.
+// It is hidden by the _XOPEN_SOURCE feature-test macro htslib otherwise
+// builds with, so ask for it explicitly; harmless where it goes unused.
+// Must precede any system header, so this has to come first.
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #define HTS_BUILDING_LIBRARY // Enables HTSLIB_EXPORT, see htslib/hts_defs.h
 #include <config.h>
 
@@ -209,12 +217,15 @@ char *kstrtok(const char *str, const char *sep_in, ks_tokaux_t *aux)
 		// on a VCF parse this func was 146% faster with // strchr.
 		// Equiv to:
 		// for (p = start; *p; ++p) if (*p == aux->sep) break;
-
-		// NB: We could use strchrnul() here from glibc if detected,
-		// which is ~40% faster again, but it's not so portable.
-		// i.e.   p = (uint8_t *)strchrnul((char *)start, aux->sep);
+#ifdef HAVE_STRCHRNUL
+		// strchrnul() avoids the separate strlen() pass above for the
+		// last token, measured ~40% faster again on the same VCF
+		// parsing benchmark.
+		p = (uint8_t *)strchrnul((char *)start, aux->sep);
+#else
 		uint8_t *p2 = (uint8_t *)strchr((char *)start, aux->sep);
 		p = p2 ? p2 : start + strlen((char *)start);
+#endif
 	}
 	aux->p = (const char *) p; // end of token
 	if (*p == 0) aux->finished = 1; // no more tokens
